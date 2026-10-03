@@ -4,6 +4,7 @@
 #include "gstmoqsink.h"
 
 #include <gst/gst.h>
+#include <moq/cmaf.h>
 #include <moq/endpoint.h>
 #include <moq/media_sender.h>
 #include <moq/rcbuf.h>
@@ -41,6 +42,48 @@ typedef struct
 
 static GMutex log_lock;
 static GArray *call_log;        /* LogEntry */
+
+/* What the element handed libmoq at attach: the root contentProtections array
+ * (CMSF 4.1.1), flattened to strings. */
+#define MAX_CP 8
+typedef struct
+{
+  guint  count;
+  gchar *ref_id[MAX_CP];
+  gchar *kid[MAX_CP];
+  gchar *scheme[MAX_CP];
+  gchar *system_id[MAX_CP];
+  gchar *la_url[MAX_CP];
+  gchar *pssh[MAX_CP];
+} CpCapture;
+static CpCapture attached_cps;
+
+/* track name -> comma-joined contentProtectionRefIDs declared at add_track. */
+static GHashTable *track_refs;
+
+static gchar *
+span_dup (moq_bytes_t b)
+{
+  return b.data ? g_strndup ((const gchar *) b.data, b.len) : NULL;
+}
+
+static void
+capture_reset (void)
+{
+  for (guint i = 0; i < attached_cps.count; i++) {
+    g_clear_pointer (&attached_cps.ref_id[i], g_free);
+    g_clear_pointer (&attached_cps.kid[i], g_free);
+    g_clear_pointer (&attached_cps.scheme[i], g_free);
+    g_clear_pointer (&attached_cps.system_id[i], g_free);
+    g_clear_pointer (&attached_cps.la_url[i], g_free);
+    g_clear_pointer (&attached_cps.pssh[i], g_free);
+  }
+  attached_cps.count = 0;
+  if (track_refs)
+    g_hash_table_remove_all (track_refs);
+  else
+    track_refs = g_hash_table_new_full (g_str_hash, g_str_equal, g_free, g_free);
+}
 
 static void
 log_reset (void)
@@ -225,9 +268,23 @@ moq_media_sender_attach (moq_endpoint_t *ep,
     const moq_media_sender_cfg_t *cfg, moq_media_sender_t **out)
 {
   (void) ep;
-  (void) cfg;
   g_assert_true (inside_task); /* Fails if attach escapes the managed turn. */
   log_add (OP_ATTACH, NULL);
+  /* Capture the authored contentProtections for the /cp/ cases. */
+  attached_cps.count = 0;
+  for (size_t i = 0; i < cfg->content_protection_count && i < MAX_CP; i++) {
+    const moq_cmsf_content_protection_t *cp = &cfg->content_protections[i];
+    guint k = attached_cps.count++;
+    attached_cps.ref_id[k] = span_dup (cp->ref_id);
+    attached_cps.scheme[k] = span_dup (cp->scheme);
+    attached_cps.kid[k] = cp->default_kid_count > 0
+        ? span_dup (cp->default_kids[0]) : NULL;
+    attached_cps.system_id[k] = span_dup (cp->drm_system.system_id);
+    attached_cps.la_url[k] = cp->drm_system.la_url.present
+        ? span_dup (cp->drm_system.la_url.url) : NULL;
+    attached_cps.pssh[k] = cp->drm_system.has_pssh
+        ? span_dup (cp->drm_system.pssh) : NULL;
+  }
   g_mutex_lock (&task_lock);
   running_entered = TRUE;
   g_cond_broadcast (&task_cond);
@@ -252,6 +309,18 @@ moq_media_sender_add_track (moq_media_sender_t *s,
     return MOQ_ERR_NOMEM;
   gchar *name = g_strndup ((const gchar *) cfg->name.data, cfg->name.len);
   log_add (OP_ADD_TRACK, name);
+
+  GString *refs = g_string_new (NULL);
+  for (size_t i = 0; i < cfg->content_protection_ref_id_count; i++) {
+    if (i)
+      g_string_append_c (refs, ',');
+    gchar *r = span_dup (cfg->content_protection_ref_ids[i]);
+    g_string_append (refs, r ? r : "");
+    g_free (r);
+  }
+  g_hash_table_replace (track_refs, g_strdup (name),
+      g_string_free (refs, FALSE));
+
   *out = (moq_media_track_t *) (cfg->media_type == MOQ_MEDIA_TYPE_AUDIO
       ? &fake_track_audio : &fake_track_video);
   g_free (name);
@@ -796,6 +865,312 @@ test_timestamps_and_groups (void)
   close_source (asrc); close_source (vsrc); gst_object_unref (sink);
 }
 
+/* -- CMSF contentProtections (CMSF 4.1.1) --------------------------------- */
+
+/* A CMAF init segment, optionally CENC-protected:
+ *   ftyp + moov(trak(tkhd mdia(mdhd minf(stbl(stsd(
+ *       <avc1|encv>(VisualSampleEntry avcC [sinf(frma schm schi(tenc))]))))))
+ * Layout mirrors libmoq's own cmaf parser expectations; the first assertion of
+ * every test below is that libmoq parses this back, so a wrong fixture fails
+ * loudly rather than quietly weakening the test. */
+static const guint8 fixture_avcc[] = { 0x01, 0x42, 0xe0, 0x1e };
+
+static gsize
+box_hdr (guint8 *o, guint32 size, const gchar type[4])
+{
+  GST_WRITE_UINT32_BE (o, size);
+  memcpy (o + 4, type, 4);
+  return 8;
+}
+
+static gsize
+build_cmaf_init (guint8 *out, guint32 timescale, guint16 w, guint16 h,
+    gboolean protected_, const gchar scheme[4], const guint8 kid[16])
+{
+  gsize avcc_box = 8 + sizeof fixture_avcc;
+  /* ISO/IEC 23001-7 8.2.2 TrackEncryptionBox body: version/flags(4) +
+   * reserved(1) + reserved-or-pattern(1) + default_isProtected(1) +
+   * default_Per_Sample_IV_Size(1) + default_KID(16) = 24. TWO bytes precede
+   * isProtected, not one -- a fixture that writes 23 shifts the KID by a byte
+   * and silently agrees with a parser that reads it one byte early. */
+  gsize tenc_box = protected_ ? 8 + 24 : 0;
+  gsize schi_box = protected_ ? 8 + tenc_box : 0;
+  gsize schm_box = protected_ ? 20 : 0;          /* hdr + v/f + 4cc + version */
+  gsize frma_box = protected_ ? 12 : 0;          /* hdr + 4cc */
+  gsize sinf_box = protected_ ? 8 + frma_box + schm_box + schi_box : 0;
+  gsize entry_box = 8 + 78 + avcc_box + sinf_box;
+  gsize stsd_box = 8 + 8 + entry_box;
+  gsize stbl_box = 8 + stsd_box;
+  gsize minf_box = 8 + stbl_box;
+  gsize mdhd_box = 28;
+  gsize mdia_box = 8 + mdhd_box + minf_box;
+  gsize tkhd_box = 24;
+  gsize trak_box = 8 + tkhd_box + mdia_box;
+  gsize moov_box = 8 + trak_box;
+  gsize p = 0;
+
+  p += box_hdr (out + p, 20, "ftyp");
+  memcpy (out + p, "isom", 4); p += 4;
+  GST_WRITE_UINT32_BE (out + p, 0); p += 4;
+  memcpy (out + p, "isom", 4); p += 4;
+
+  p += box_hdr (out + p, moov_box, "moov");
+  p += box_hdr (out + p, trak_box, "trak");
+  p += box_hdr (out + p, tkhd_box, "tkhd");
+  memset (out + p, 0, 12); p += 12;              /* v/f + creation + modification */
+  GST_WRITE_UINT32_BE (out + p, 1); p += 4;      /* track_ID */
+
+  p += box_hdr (out + p, mdia_box, "mdia");
+  p += box_hdr (out + p, mdhd_box, "mdhd");
+  memset (out + p, 0, 12); p += 12;              /* v/f + creation + modification */
+  GST_WRITE_UINT32_BE (out + p, timescale); p += 4;
+  GST_WRITE_UINT32_BE (out + p, 0); p += 4;      /* duration */
+
+  p += box_hdr (out + p, minf_box, "minf");
+  p += box_hdr (out + p, stbl_box, "stbl");
+  p += box_hdr (out + p, stsd_box, "stsd");
+  GST_WRITE_UINT32_BE (out + p, 0); p += 4;      /* v/f */
+  GST_WRITE_UINT32_BE (out + p, 1); p += 4;      /* entry_count */
+
+  p += box_hdr (out + p, entry_box, protected_ ? "encv" : "avc1");
+  memset (out + p, 0, 78);
+  GST_WRITE_UINT16_BE (out + p + 24, w);
+  GST_WRITE_UINT16_BE (out + p + 26, h);
+  p += 78;
+
+  p += box_hdr (out + p, avcc_box, "avcC");
+  memcpy (out + p, fixture_avcc, sizeof fixture_avcc);
+  p += sizeof fixture_avcc;
+
+  if (protected_) {
+    p += box_hdr (out + p, sinf_box, "sinf");
+    p += box_hdr (out + p, frma_box, "frma");
+    memcpy (out + p, "avc1", 4); p += 4;         /* original format */
+    p += box_hdr (out + p, schm_box, "schm");
+    GST_WRITE_UINT32_BE (out + p, 0); p += 4;    /* v/f */
+    memcpy (out + p, scheme, 4); p += 4;         /* scheme_type */
+    GST_WRITE_UINT32_BE (out + p, 0); p += 4;    /* scheme_version */
+    p += box_hdr (out + p, schi_box, "schi");
+    p += box_hdr (out + p, tenc_box, "tenc");
+    GST_WRITE_UINT32_BE (out + p, 0); p += 4;    /* v/f (version 0) */
+    out[p++] = 0;                                /* reserved */
+    out[p++] = 0;                                /* reserved (pattern in v1) */
+    out[p++] = 1;                                /* default_isProtected */
+    out[p++] = 8;                                /* default_Per_Sample_IV_Size */
+    memcpy (out + p, kid, 16); p += 16;          /* default_KID */
+  }
+  return p;
+}
+
+/* moof(mfhd traf(tfhd tfdt trun)) + mdat. The splitter only emits the INIT
+ * unit once a moof arrives (an init segment alone is still accumulating), so a
+ * CMAF pad needs one chunk before the barrier can see its track. */
+static gsize
+build_cmaf_chunk (guint8 *out, guint32 track_id, guint32 first_sample_flags)
+{
+  /* FullBox with a single payload word, as the CMAF fragment parser expects. */
+  gsize p = 0, traf_inner = 0;
+  guint8 inner[64];
+  gsize i = 0;
+  i += box_hdr (inner + i, 16, "tfhd");
+  GST_WRITE_UINT32_BE (inner + i, 0); i += 4;        /* version + flags */
+  GST_WRITE_UINT32_BE (inner + i, track_id); i += 4;
+  i += box_hdr (inner + i, 16, "tfdt");
+  GST_WRITE_UINT32_BE (inner + i, 0); i += 4;
+  GST_WRITE_UINT32_BE (inner + i, 0); i += 4;        /* baseMediaDecodeTime */
+  i += box_hdr (inner + i, 20, "trun");
+  GST_WRITE_UINT32_BE (inner + i, 0x00000400); i += 4;  /* first-sample-flags */
+  GST_WRITE_UINT32_BE (inner + i, 1); i += 4;           /* sample_count */
+  GST_WRITE_UINT32_BE (inner + i, first_sample_flags); i += 4;
+  traf_inner = i;
+
+  gsize moof_body = 16 /* mfhd */ + 8 + traf_inner;
+  p += box_hdr (out + p, 8 + moof_body, "moof");
+  p += box_hdr (out + p, 16, "mfhd");
+  GST_WRITE_UINT32_BE (out + p, 0); p += 4;
+  GST_WRITE_UINT32_BE (out + p, 1); p += 4;          /* sequence_number */
+  p += box_hdr (out + p, 8 + traf_inner, "traf");
+  memcpy (out + p, inner, traf_inner); p += traf_inner;
+  p += box_hdr (out + p, 9, "mdat");
+  out[p++] = 0x00;
+  return p;
+}
+
+static const guint8 fixture_kid[16] = {
+  0x10, 0x77, 0xef, 0xec, 0xc0, 0xb2, 0x4d, 0x02,
+  0xac, 0xe3, 0x3c, 0x1e, 0x52, 0xe2, 0xfb, 0x4b
+};
+#define FIXTURE_KID_UUID "1077efec-c0b2-4d02-ace3-3c1e52e2fb4b"
+#define WIDEVINE_UUID    "edef8ba9-79d6-4ace-a3c8-27dcd51d21ed"
+#define PLAYREADY_UUID   "9a04f079-9840-4286-ab92-e65be0885f95"
+
+/* Drive one CMAF request pad with an init segment and let the barrier commit.
+ * Returns the init length actually built. */
+static void
+push_cmaf_init (GstElement *sink, gboolean protected_, const gchar scheme[4])
+{
+  guint8 init[1024];
+  gsize len = build_cmaf_init (init, 90000, 1920, 1080, protected_, scheme,
+      fixture_kid);
+  g_assert_cmpuint (len, <, sizeof init);
+
+  /* The fixture must be what libmoq thinks it is, or nothing below means
+   * anything. */
+  moq_cmaf_init_info_t probe;
+  moq_cmaf_init_info_init (&probe);
+  g_assert_cmpint (moq_cmaf_parse_init ((moq_bytes_t) { init, len }, &probe),
+      ==, MOQ_OK);
+  g_assert_true (probe.has_cenc == (protected_ ? true : false));
+  if (protected_) {
+    g_assert_cmpuint (probe.default_kid.len, ==, 16);
+    g_assert_cmpint (memcmp (probe.default_kid.data, fixture_kid, 16), ==, 0);
+    g_assert_cmpint (memcmp (probe.scheme.data, scheme, 4), ==, 0);
+  }
+
+  /* One video pad, so one track reaches the startup task; run_posted asserts
+   * this count, and the barrier cases above leave their own totals behind. */
+  added_tracks = 0;
+  expected_tracks = 1;
+
+  g_assert_cmpint (gst_element_set_state (sink, GST_STATE_PAUSED), !=,
+      GST_STATE_CHANGE_FAILURE);
+
+  /* A video_%u request pad defaults its track-name to "video". */
+  GstPad *peer = gst_element_request_pad_simple (sink, "video_%u");
+  g_assert_nonnull (peer);
+
+  GstPad *src = gst_pad_new (NULL, GST_PAD_SRC);
+  g_assert_cmpint (gst_pad_link (src, peer), ==, GST_PAD_LINK_OK);
+  gst_pad_set_active (src, TRUE);
+  g_assert_true (gst_pad_push_event (src,
+          gst_event_new_stream_start ("cmaf-stream")));
+  gst_pad_push_event (src,
+      gst_event_new_caps (gst_caps_new_empty_simple ("video/quicktime")));
+  g_assert_true (gst_pad_has_current_caps (peer));
+  GstSegment seg;
+  gst_segment_init (&seg, GST_FORMAT_TIME);
+  g_assert_true (gst_pad_push_event (src, gst_event_new_segment (&seg)));
+
+  GstBuffer *b = gst_buffer_new_memdup (init, len);
+  GST_BUFFER_PTS (b) = 0;
+  g_assert_cmpint (gst_pad_push (src, b), ==, GST_FLOW_OK);
+
+  /* One sync chunk: this is what makes the splitter release the init, which
+   * runs prepare -> barrier -> attach -> add_track. */
+  guint8 chunk[256];
+  gsize clen = build_cmaf_chunk (chunk, 1, 0 /* sync: non-sync bit clear */);
+  moq_cmaf_sample_t samples[8];
+  moq_cmaf_fragment_info_t fi;
+  moq_cmaf_fragment_info_init (&fi, samples, G_N_ELEMENTS (samples));
+  g_assert_cmpint (moq_cmaf_parse_fragment ((moq_bytes_t) { chunk, clen }, &fi),
+      ==, MOQ_OK);
+
+  GstBuffer *cb = gst_buffer_new_memdup (chunk, clen);
+  GST_BUFFER_PTS (cb) = 0;
+  g_assert_cmpint (gst_pad_push (src, cb), ==, GST_FLOW_OK);
+
+  gst_element_set_state (sink, GST_STATE_NULL);
+  gst_pad_set_active (src, FALSE);
+  gst_object_unref (src);
+  gst_object_unref (peer);
+}
+
+/* The scheme and KID are never configured -- they come from the init segment's
+ * own sinf/schm/schi(tenc). drm-systems supplies only what an fMP4 cannot. */
+static void
+test_cp_authored_from_init (void)
+{
+  log_reset ();
+  capture_reset ();
+  GstElement *sink = new_sink ();
+  g_object_set (sink, "drm-systems",
+      WIDEVINE_UUID ",laurl=https://lic.example/wv,pssh=AAAAQ3Bzc2g=", NULL);
+
+  push_cmaf_init (sink, TRUE, "cenc");
+
+  g_assert_cmpuint (attached_cps.count, ==, 1);
+  g_assert_cmpstr (attached_cps.ref_id[0], ==, "cp0");
+  /* Derived from the tenc default_KID: raw 16 bytes -> CMSF UUID string. */
+  g_assert_cmpstr (attached_cps.kid[0], ==, FIXTURE_KID_UUID);
+  g_assert_cmpstr (attached_cps.scheme[0], ==, "cenc");
+  g_assert_cmpstr (attached_cps.system_id[0], ==, WIDEVINE_UUID);
+  g_assert_cmpstr (attached_cps.la_url[0], ==, "https://lic.example/wv");
+  /* The '=' padding of a base64 PSSH must survive the key=value split. */
+  g_assert_cmpstr (attached_cps.pssh[0], ==, "AAAAQ3Bzc2g=");
+
+  g_assert_cmpstr (g_hash_table_lookup (track_refs, "video"), ==, "cp0");
+
+  gst_object_unref (sink);
+}
+
+/* CMSF carries one drmSystem per entry, so two systems over one key means two
+ * entries sharing the KID, and the track references both. */
+static void
+test_cp_two_systems_one_key (void)
+{
+  log_reset ();
+  capture_reset ();
+  GstElement *sink = new_sink ();
+  g_object_set (sink, "drm-systems",
+      WIDEVINE_UUID ",laurl=https://lic.example/wv;"
+      PLAYREADY_UUID ",laurl=https://lic.example/pr", NULL);
+
+  push_cmaf_init (sink, TRUE, "cbcs");
+
+  g_assert_cmpuint (attached_cps.count, ==, 2);
+  g_assert_cmpstr (attached_cps.ref_id[0], ==, "cp0");
+  g_assert_cmpstr (attached_cps.ref_id[1], ==, "cp1");
+  g_assert_cmpstr (attached_cps.system_id[0], ==, WIDEVINE_UUID);
+  g_assert_cmpstr (attached_cps.system_id[1], ==, PLAYREADY_UUID);
+  /* One key, carried by both, and the scheme comes from schm, not config. */
+  g_assert_cmpstr (attached_cps.kid[0], ==, FIXTURE_KID_UUID);
+  g_assert_cmpstr (attached_cps.kid[1], ==, FIXTURE_KID_UUID);
+  g_assert_cmpstr (attached_cps.scheme[0], ==, "cbcs");
+  g_assert_cmpstr (attached_cps.scheme[1], ==, "cbcs");
+
+  g_assert_cmpstr (g_hash_table_lookup (track_refs, "video"), ==, "cp0,cp1");
+
+  gst_object_unref (sink);
+}
+
+/* An encrypted track with no DRM system configured: libmoq would reject a
+ * contentProtection with no systemID, so the catalog carries none and the
+ * element warns. Pins the documented fallback rather than a crash or a bogus
+ * entry. */
+static void
+test_cp_encrypted_without_systems (void)
+{
+  log_reset ();
+  capture_reset ();
+  GstElement *sink = new_sink ();
+
+  push_cmaf_init (sink, TRUE, "cenc");
+
+  g_assert_cmpuint (attached_cps.count, ==, 0);
+  g_assert_cmpstr (g_hash_table_lookup (track_refs, "video"), ==, "");
+
+  gst_object_unref (sink);
+}
+
+/* A clear track must never be described as protected, even with drm-systems
+ * set: declaring refIDs on an unencrypted track would make libmoq reject the
+ * add, and would lie to subscribers. */
+static void
+test_cp_clear_track_declares_nothing (void)
+{
+  log_reset ();
+  capture_reset ();
+  GstElement *sink = new_sink ();
+  g_object_set (sink, "drm-systems", WIDEVINE_UUID, NULL);
+
+  push_cmaf_init (sink, FALSE, "cenc");
+
+  g_assert_cmpuint (attached_cps.count, ==, 0);
+  g_assert_cmpstr (g_hash_table_lookup (track_refs, "video"), ==, "");
+
+  gst_object_unref (sink);
+}
+
 int
 main (int argc, char **argv)
 {
@@ -804,6 +1179,7 @@ main (int argc, char **argv)
   g_mutex_init (&log_lock);
   g_mutex_init (&task_lock); g_cond_init (&task_cond);
   log_reset ();
+  capture_reset ();
   g_test_add_func ("/barrier/initial-catalog-complete",
       test_initial_catalog_complete);
   g_test_add_func ("/barrier/unlinked-pad-excluded", test_unlinked_pad_excluded);
@@ -821,6 +1197,12 @@ main (int argc, char **argv)
   g_test_add_data_func ("/barrier/audio-he-rejected", GUINT_TO_POINTER (1), test_bad_audio_config);
   g_test_add_data_func ("/barrier/audio-caps-mismatch", GUINT_TO_POINTER (2), test_bad_audio_config);
   g_test_add_func ("/barrier/capture-and-groups", test_timestamps_and_groups);
+  g_test_add_func ("/cp/authored-from-init", test_cp_authored_from_init);
+  g_test_add_func ("/cp/two-systems-one-key", test_cp_two_systems_one_key);
+  g_test_add_func ("/cp/encrypted-without-systems",
+      test_cp_encrypted_without_systems);
+  g_test_add_func ("/cp/clear-track-declares-nothing",
+      test_cp_clear_track_declares_nothing);
   int result = g_test_run ();
   log_reset (); g_array_unref (call_log);
   return result;

@@ -110,6 +110,7 @@ enum
   PROP_CATALOG_REFRESH_MS,
   PROP_CATALOG_WAIT_MS,
   PROP_LOC_AUDIO_GROUP_MS,
+  PROP_DRM_SYSTEMS,
 };
 
 /* Immutable diagnostic snapshot, owned until sender callbacks are settled. */
@@ -119,6 +120,12 @@ typedef struct {
   moq_media_track_cfg_t cfg;
   GstMoqSinkPad *pad;
   GBytes *name, *codec, *channels, *init;
+  /* contentProtectionRefIDs: the spans are copied because the caller's array is
+   * a temporary, and the strings they point at because the pad clears
+   * pend_cp_ref_ids on reset (gst_moq_sink_pad_reset) while this snapshot may
+   * still be queued. */
+  gchar **cp_ref_strv;
+  moq_bytes_t *cp_refs;
   moq_media_track_t *track;
 } PreparedTrack;
 
@@ -131,6 +138,24 @@ typedef struct {
   moq_media_sender_t *sender;
   GPtrArray *tracks;
 } SenderStartup;
+
+/* One authored CMSF 4.1.1 contentProtections entry: a (scheme, defaultKID, DRM
+ * system) triple. CMSF carries ONE drmSystem per entry, so a stream offered
+ * under several systems produces one entry per system, all sharing the KID, and
+ * the track references them all. The strings own the bytes that back the
+ * moq_bytes_t spans handed to libmoq. */
+typedef struct
+{
+  gchar *ref_id;        /* refID, generated: "cp0", "cp1", ... */
+  gchar *kid_uuid;      /* defaultKID as the CMSF "8-4-4-4-12" UUID string */
+  gchar *scheme;        /* "cenc" or "cbcs", from the init segment's schm */
+  gchar *system_id;     /* drmSystem.systemID, a UUID string */
+  gchar *la_url;        /* NULL when absent */
+  gchar *cert_url;
+  gchar *auth_url;
+  gchar *pssh;          /* base64, opaque to us and to libmoq */
+  gchar *robustness;
+} MoqCpEntry;
 
 struct _GstMoqSink
 {
@@ -147,6 +172,7 @@ struct _GstMoqSink
   gboolean sync;
   gboolean sap_timeline;
   guint64  max_fragment_size;
+  gchar   *drm_systems;    /* DRM systems spec; see the property docs */
 
   /* runtime */
   moq_endpoint_t     *ep;
@@ -185,6 +211,14 @@ struct _GstMoqSink
   GPtrArray   *preparing_tracks; /* app-thread snapshot, under track_lock */
   gboolean     tracks_committed;
   gboolean     tracks_failed;
+
+  /* CMSF 4.1.1 root contentProtections authored for this session, built at the
+   * barrier (gst_moq_sink_build_content_protections) from every protected CMAF
+   * pad's init segment crossed with drm-systems. Owned; the entries' strings
+   * back the moq_bytes_t spans handed to libmoq, which deep-copies them at
+   * attach and at add_track, so this only has to outlive commit_tracks -- it is
+   * kept until stop so the values stay inspectable. Guarded by track_lock. */
+  GArray      *cp_entries;        /* MoqCpEntry */
 
   /* Raw PTS of the most recent VIDEO group start, published so the audio pad
    * can open its group at the same instant (see gst_moq_sink_chain_loc).
@@ -596,6 +630,8 @@ prepared_track_free (gpointer data)
   g_bytes_unref (t->codec);
   g_bytes_unref (t->channels);
   g_bytes_unref (t->init);
+  g_strfreev (t->cp_ref_strv);
+  g_free (t->cp_refs);
   g_free (t);
 }
 
@@ -611,6 +647,18 @@ register_track (GstMoqSink *self, GstMoqSinkPad *pad,
     t->cfg.codec = snapshot_span (cfg->codec, &t->codec);
     t->cfg.channel_config = snapshot_span (cfg->channel_config, &t->channels);
     t->cfg.init_data = snapshot_span (cfg->init_data, &t->init);
+    if (cfg->content_protection_ref_id_count > 0) {
+      size_t n = cfg->content_protection_ref_id_count;
+      t->cp_ref_strv = g_new0 (gchar *, n + 1);
+      t->cp_refs = g_new0 (moq_bytes_t, n);
+      for (size_t i = 0; i < n; i++) {
+        const moq_bytes_t *r = &cfg->content_protection_ref_ids[i];
+        t->cp_ref_strv[i] = g_strndup ((const gchar *) r->data, r->len);
+        t->cp_refs[i].data = (const uint8_t *) t->cp_ref_strv[i];
+        t->cp_refs[i].len = r->len;
+      }
+      t->cfg.content_protection_ref_ids = t->cp_refs;
+    }
     g_ptr_array_add (self->preparing_tracks, t);
     return MOQ_OK;
   }
@@ -784,6 +832,8 @@ gst_moq_sink_add_loc_track (GstMoqSink *self, GstMoqSinkPad *pad)
 static GstFlowReturn gst_moq_sink_add_cmaf_track (GstMoqSink *self,
     GstMoqSinkPad *pad, GBytes *init);
 static gboolean gst_moq_sink_open_sender (GstMoqSink *self);
+static void gst_moq_sink_build_content_protections (GstMoqSink *self);
+static void gst_moq_sink_clear_content_protections (GstMoqSink *self);
 
 static gboolean
 pad_cancelled (GstMoqSink *self, GstMoqSinkPad *pad)
@@ -828,6 +878,16 @@ gst_moq_sink_commit_tracks (GstMoqSink *self)
     return;
 
   self->preparing_tracks = g_ptr_array_new_with_free_func (prepared_track_free);
+
+  /* Author the root contentProtections BEFORE the pad walk, not at attach time:
+   * it is what fills each protected pad's pend_cp_ref_ids, and the walk below
+   * reads them into every track cfg. Authoring it later (where the attach
+   * happens) leaves every track declaring no refIDs while the root entries are
+   * published -- a catalog that advertises DRM systems no track references, so
+   * a subscriber reads the tracks as clear while the objects are encrypted.
+   * Safe this early: it needs only each pad's parsed init_info, which
+   * gst_moq_sink_prepare_cmaf_track filled before the barrier released. */
+  gst_moq_sink_build_content_protections (self);
 
   /* Snapshot the pad list so the walk does not hold OBJECT_LOCK across
    * add_track (which takes send_lock). */
@@ -1074,9 +1134,15 @@ gst_moq_sink_chain_loc (GstMoqSink *self, GstMoqSinkPad *pad, GstBuffer *buffer)
 
 /* -- CMAF path (request pads) ------------------------------------------- */
 
-/* Register a CMAF track from its init segment (ftyp + moov). */
-static GstFlowReturn
-gst_moq_sink_add_cmaf_track (GstMoqSink *self, GstMoqSinkPad *pad, GBytes *init)
+/* Parse a CMAF pad's init segment and stash what the track needs on the pad.
+ * Split from the add for the same reason as the LOC pads -- see
+ * gst_moq_sink_await_tracks -- and additionally because the CENC boxes this
+ * parse yields (has_cenc / scheme / default_KID) have to be known BEFORE the
+ * sender is attached: the catalog's root contentProtections travel in the
+ * sender cfg. */
+static gboolean
+gst_moq_sink_prepare_cmaf_track (GstMoqSink *self, GstMoqSinkPad *pad,
+    GBytes *init)
 {
   gsize init_len;
   const guint8 *init_data = g_bytes_get_data (init, &init_len);
@@ -1088,7 +1154,7 @@ gst_moq_sink_add_cmaf_track (GstMoqSink *self, GstMoqSinkPad *pad, GBytes *init)
     GST_ELEMENT_ERROR (self, STREAM, FORMAT,
         ("could not parse CMAF init segment on pad %s (rc=%d)",
             GST_PAD_NAME (pad), (int) rc), (NULL));
-    return GST_FLOW_ERROR;
+    return FALSE;
   }
   pad->has_init_info = TRUE;
 
@@ -1098,7 +1164,7 @@ gst_moq_sink_add_cmaf_track (GstMoqSink *self, GstMoqSinkPad *pad, GBytes *init)
         ("unsupported codec in CMAF init segment on pad %s (libmoq kind %d); "
             "this plugin publishes avc1, mp4a and opus", GST_PAD_NAME (pad),
             (int) pad->init_info.codec_kind), (NULL));
-    return GST_FLOW_ERROR;
+    return FALSE;
   }
   if ((pad->media_type == MOQ_MEDIA_TYPE_AUDIO) !=
       (pad->init_info.codec_kind == MOQ_CMAF_CODEC_AAC ||
@@ -1109,6 +1175,28 @@ gst_moq_sink_add_cmaf_track (GstMoqSink *self, GstMoqSinkPad *pad, GBytes *init)
             pad->media_type == MOQ_MEDIA_TYPE_AUDIO ? "audio" : "video",
             codec), (NULL));
     g_free (codec);
+    return FALSE;
+  }
+
+  g_free (pad->pend_codec);
+  pad->pend_codec = codec;
+  return TRUE;
+}
+
+/* Register a prepared CMAF track. Caller holds track_lock and has already
+ * attached the sender. */
+static GstFlowReturn
+gst_moq_sink_add_cmaf_track (GstMoqSink *self, GstMoqSinkPad *pad, GBytes *init)
+{
+  gsize init_len;
+  const guint8 *init_data = g_bytes_get_data (init, &init_len);
+  const gchar *codec = pad->pend_codec;
+  moq_result_t rc;
+
+  if (!pad->has_init_info || !codec) {
+    GST_ELEMENT_ERROR (self, STREAM, FAILED,
+        ("CMAF track on pad %s was not prepared before the add",
+            GST_PAD_NAME (pad)), (NULL));
     return GST_FLOW_ERROR;
   }
 
@@ -1130,6 +1218,22 @@ gst_moq_sink_add_cmaf_track (GstMoqSink *self, GstMoqSinkPad *pad, GBytes *init)
   tc.init_data.data = init_data;
   tc.init_data.len = init_len;
   tc.emit_sap_timeline = self->sap_timeline;
+  /* CMSF 4.1.2: declaring these ids tells a subscriber the track is encrypted,
+   * and libmoq cross-checks that every id resolves to a root entry AND that
+   * init_data really carries the 4.2 CENC boxes. Resolved at the barrier, so an
+   * unprotected track leaves this empty. */
+  guint n_refs = pad->pend_cp_ref_ids
+      ? g_strv_length (pad->pend_cp_ref_ids) : 0;
+  moq_bytes_t *refs = NULL;
+  if (n_refs > 0) {
+    refs = g_new0 (moq_bytes_t, n_refs);
+    for (guint i = 0; i < n_refs; i++) {
+      refs[i].data = (const uint8_t *) pad->pend_cp_ref_ids[i];
+      refs[i].len = strlen (pad->pend_cp_ref_ids[i]);
+    }
+    tc.content_protection_ref_ids = refs;
+    tc.content_protection_ref_id_count = n_refs;
+  }
   if (pad->media_type == MOQ_MEDIA_TYPE_VIDEO) {
     tc.width = pad->init_info.width;
     tc.height = pad->init_info.height;
@@ -1141,11 +1245,17 @@ gst_moq_sink_add_cmaf_track (GstMoqSink *self, GstMoqSinkPad *pad, GBytes *init)
     tc.channel_config.len = strlen (channels);
   }
 
+  /* register_track either adds the track now or defers the cfg to the sender
+   * startup task; it snapshots every span it keeps, refs included, so the
+   * array is ours to free either way. */
   rc = register_track (self, pad, &tc);
+  g_free (refs);
   if (rc != MOQ_OK) {
     GST_ELEMENT_ERROR (self, RESOURCE, OPEN_WRITE,
-        ("could not add CMAF track \"%s\" codec=%s (rc=%d)",
-            pad->track_name, codec, (int) rc), (NULL));
+        ("could not add CMAF track \"%s\" codec=%s (rc=%d)%s",
+            pad->track_name, codec, (int) rc,
+            n_refs ? " -- an encrypted track needs an init segment carrying "
+            "the CMSF 4.2 CENC boxes" : ""), (NULL));
   } else if (pad->media_type == MOQ_MEDIA_TYPE_VIDEO) {
     GST_DEBUG_OBJECT (pad, "prepared CMAF track %s codec=%s %ux%u timescale=%u "
         "init=%" G_GSIZE_FORMAT " B", pad->track_name, codec,
@@ -1157,7 +1267,6 @@ gst_moq_sink_add_cmaf_track (GstMoqSink *self, GstMoqSinkPad *pad, GBytes *init)
         pad->init_info.samplerate, channels, pad->init_info.timescale,
         init_len);
   }
-  g_free (codec);
   return rc == MOQ_OK ? GST_FLOW_OK : GST_FLOW_ERROR;
 }
 
@@ -1275,11 +1384,17 @@ gst_moq_sink_chain_cmaf (GstMoqSink *self, GstMoqSinkPad *pad, GstBuffer *buffer
       } else {
         g_clear_pointer (&pad->init, g_bytes_unref);
         pad->init = g_bytes_ref (u->data);
-        /* Attaches the sender once every linked pad has its init segment, so
-         * the initial catalog carries them all (gst_moq_sink_await_tracks). */
-        if (!gst_moq_sink_await_tracks (self, pad))
+        /* Parse before the barrier: the catalog's contentProtections are built
+         * from these CENC boxes and travel in the sender cfg, so the parse has
+         * to precede the attach (gst_moq_sink_build_content_protections). */
+        if (!gst_moq_sink_prepare_cmaf_track (self, pad, pad->init)) {
+          ret = GST_FLOW_ERROR;
+        } else if (!gst_moq_sink_await_tracks (self, pad)) {
+          /* Attaches the sender once every linked pad has its init segment, so
+           * the initial catalog carries them all. */
           ret = (pad->flushing || !self->started)
               ? GST_FLOW_FLUSHING : GST_FLOW_ERROR;
+        }
       }
     } else {
       if (!pad->track) {
@@ -1720,6 +1835,280 @@ gst_moq_sink_start (GstMoqSink *self)
   return TRUE;
 }
 
+/* -- CMSF content protection (CMSF 4) ------------------------------------- */
+
+/* tenc default_KID is 16 raw bytes; CMSF 4.1.1.2 wants the UUID STRING form,
+ * and libmoq validates that syntax on encode (msf.c cp_is_uuid), so the hyphens
+ * are mandatory. Returns NULL for anything that is not a 16-byte KID. */
+static gchar *
+moq_kid_to_uuid (const guint8 *kid, gsize len)
+{
+  if (!kid || len != 16)
+    return NULL;
+  return g_strdup_printf (
+      "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-"
+      "%02x%02x%02x%02x%02x%02x",
+      kid[0], kid[1], kid[2], kid[3], kid[4], kid[5], kid[6], kid[7],
+      kid[8], kid[9], kid[10], kid[11], kid[12], kid[13], kid[14], kid[15]);
+}
+
+static void
+moq_cp_entry_clear (MoqCpEntry *e)
+{
+  g_clear_pointer (&e->ref_id, g_free);
+  g_clear_pointer (&e->kid_uuid, g_free);
+  g_clear_pointer (&e->scheme, g_free);
+  g_clear_pointer (&e->system_id, g_free);
+  g_clear_pointer (&e->la_url, g_free);
+  g_clear_pointer (&e->cert_url, g_free);
+  g_clear_pointer (&e->auth_url, g_free);
+  g_clear_pointer (&e->pssh, g_free);
+  g_clear_pointer (&e->robustness, g_free);
+}
+
+static void
+gst_moq_sink_clear_content_protections (GstMoqSink *self)
+{
+  if (!self->cp_entries)
+    return;
+  for (guint i = 0; i < self->cp_entries->len; i++)
+    moq_cp_entry_clear (&g_array_index (self->cp_entries, MoqCpEntry, i));
+  g_array_set_size (self->cp_entries, 0);
+}
+
+/* One system from the drm-systems spec: a bare systemID UUID, then optional
+ * key=value fields. Appends nothing and returns FALSE if the systemID is
+ * missing. Values are taken verbatim -- libmoq carries DRM metadata opaquely
+ * and checks only the UUID syntax. */
+static gboolean
+moq_parse_drm_system (GstMoqSink *self, const gchar *spec, MoqCpEntry *out)
+{
+  gchar **fields = g_strsplit (spec, ",", -1);
+  gboolean ok = FALSE;
+
+  for (guint i = 0; fields[i]; i++) {
+    gchar *f = g_strstrip (fields[i]);
+    if (*f == '\0')
+      continue;
+    if (i == 0) {
+      out->system_id = g_strdup (f);
+      ok = TRUE;
+      continue;
+    }
+    /* Split on the FIRST '=' only: a base64 PSSH is padded with '='. */
+    gchar **kv = g_strsplit (f, "=", 2);
+    const gchar *k = kv[0] ? g_strstrip (kv[0]) : NULL;
+    const gchar *v = kv[1] ? g_strstrip (kv[1]) : NULL;
+    if (!k || !v || *v == '\0') {
+      GST_WARNING_OBJECT (self, "drm-systems: ignoring field \"%s\" with no "
+          "value", f);
+    } else if (!g_ascii_strcasecmp (k, "laurl")) {
+      g_free (out->la_url); out->la_url = g_strdup (v);
+    } else if (!g_ascii_strcasecmp (k, "certurl")) {
+      g_free (out->cert_url); out->cert_url = g_strdup (v);
+    } else if (!g_ascii_strcasecmp (k, "authurl")) {
+      g_free (out->auth_url); out->auth_url = g_strdup (v);
+    } else if (!g_ascii_strcasecmp (k, "pssh")) {
+      g_free (out->pssh); out->pssh = g_strdup (v);
+    } else if (!g_ascii_strcasecmp (k, "robustness")) {
+      g_free (out->robustness); out->robustness = g_strdup (v);
+    } else {
+      GST_WARNING_OBJECT (self, "drm-systems: unknown field \"%s\"", k);
+    }
+    g_strfreev (kv);
+  }
+  g_strfreev (fields);
+  if (!ok)
+    moq_cp_entry_clear (out);
+  return ok;
+}
+
+/* Build the session's root contentProtections: every protected CMAF pad's
+ * (scheme, defaultKID) crossed with every configured DRM system, and record on
+ * each pad the refIDs its track must reference.
+ *
+ * The scheme and the KID come from the init segment the pad is already
+ * forwarding -- moq_cmaf_parse_init fills has_cenc/scheme/default_kid, so
+ * nothing about the encryption itself has to be configured here. drm-systems
+ * supplies only what an fMP4 cannot carry: which DRM systems the stream is
+ * offered under, and their licence URLs and PSSH.
+ *
+ * Runs under track_lock, from gst_moq_sink_commit_tracks, ahead of the pad walk
+ * that registers the tracks -- which is why the initial-catalog barrier is a
+ * precondition for this working at all: every pad's init segment must already
+ * be parsed when the refIDs are derived, and the sender cfg freezes the root
+ * entries at attach. Caller holds track_lock. */
+static void
+gst_moq_sink_build_content_protections (GstMoqSink *self)
+{
+  gst_moq_sink_clear_content_protections (self);
+  if (!self->cp_entries)
+    self->cp_entries = g_array_new (FALSE, TRUE, sizeof (MoqCpEntry));
+
+  /* Parse drm-systems once per attach. */
+  GArray *systems = g_array_new (FALSE, TRUE, sizeof (MoqCpEntry));
+  if (self->drm_systems && *self->drm_systems) {
+    gchar **specs = g_strsplit (self->drm_systems, ";", -1);
+    for (guint i = 0; specs[i]; i++) {
+      if (*g_strstrip (specs[i]) == '\0')
+        continue;
+      MoqCpEntry sys;
+      memset (&sys, 0, sizeof sys);
+      if (moq_parse_drm_system (self, specs[i], &sys))
+        g_array_append_val (systems, sys);
+      else
+        GST_WARNING_OBJECT (self, "drm-systems: no systemID in \"%s\"; entry "
+            "skipped", specs[i]);
+    }
+    g_strfreev (specs);
+  }
+
+  GList *pads = NULL;
+  GST_OBJECT_LOCK (self);
+  for (GList *l = GST_ELEMENT (self)->sinkpads; l; l = l->next)
+    pads = g_list_prepend (pads, gst_object_ref (l->data));
+  GST_OBJECT_UNLOCK (self);
+  pads = g_list_reverse (pads);
+
+  guint protected_pads = 0;
+  for (GList *l = pads; l; l = l->next) {
+    GstMoqSinkPad *p = GST_MOQ_SINK_PAD (l->data);
+    g_clear_pointer (&p->pend_cp_ref_ids, g_strfreev);
+
+    if (!p->pend_ready || p->packaging != MOQ_MEDIA_PACKAGING_CMAF ||
+        !p->has_init_info || !p->init_info.has_cenc)
+      continue;
+    protected_pads++;
+
+    gchar *kid = moq_kid_to_uuid (p->init_info.default_kid.data,
+        p->init_info.default_kid.len);
+    if (!kid) {
+      GST_WARNING_OBJECT (p, "encrypted CMAF track with no usable tenc "
+          "default_KID (%" G_GSIZE_FORMAT " bytes); publishing it without "
+          "contentProtections", (gsize) p->init_info.default_kid.len);
+      continue;
+    }
+    gchar *scheme = g_strndup ((const gchar *) p->init_info.scheme.data,
+        p->init_info.scheme.len);
+
+    if (systems->len == 0) {
+      GST_WARNING_OBJECT (p, "CMAF track is %s-encrypted (KID %s) but no "
+          "drm-systems are configured: the catalog will carry no "
+          "contentProtections and a subscriber has no way to obtain a key",
+          scheme, kid);
+      g_free (kid);
+      g_free (scheme);
+      continue;
+    }
+
+    GPtrArray *refs = g_ptr_array_new ();
+    for (guint i = 0; i < systems->len; i++) {
+      MoqCpEntry *sys = &g_array_index (systems, MoqCpEntry, i);
+      /* Reuse an entry when another pad shares this key and system. */
+      MoqCpEntry *found = NULL;
+      for (guint j = 0; j < self->cp_entries->len && !found; j++) {
+        MoqCpEntry *e = &g_array_index (self->cp_entries, MoqCpEntry, j);
+        if (!g_strcmp0 (e->kid_uuid, kid) && !g_strcmp0 (e->scheme, scheme) &&
+            !g_strcmp0 (e->system_id, sys->system_id))
+          found = e;
+      }
+      if (!found) {
+        MoqCpEntry e;
+        memset (&e, 0, sizeof e);
+        e.ref_id = g_strdup_printf ("cp%u", self->cp_entries->len);
+        e.kid_uuid = g_strdup (kid);
+        e.scheme = g_strdup (scheme);
+        e.system_id = g_strdup (sys->system_id);
+        e.la_url = g_strdup (sys->la_url);
+        e.cert_url = g_strdup (sys->cert_url);
+        e.auth_url = g_strdup (sys->auth_url);
+        e.pssh = g_strdup (sys->pssh);
+        e.robustness = g_strdup (sys->robustness);
+        g_array_append_val (self->cp_entries, e);
+        found = &g_array_index (self->cp_entries, MoqCpEntry,
+            self->cp_entries->len - 1);
+      }
+      g_ptr_array_add (refs, g_strdup (found->ref_id));
+    }
+    g_ptr_array_add (refs, NULL);
+    p->pend_cp_ref_ids = (gchar **) g_ptr_array_free (refs, FALSE);
+    GST_INFO_OBJECT (p, "CMAF track is %s-encrypted, KID %s, offered under %u "
+        "DRM system(s)", scheme, kid, systems->len);
+    g_free (kid);
+    g_free (scheme);
+  }
+  g_list_free_full (pads, gst_object_unref);
+
+  if (protected_pads == 0 && systems->len > 0)
+    GST_WARNING_OBJECT (self, "drm-systems is set but no track carries CENC "
+        "boxes; the catalog will claim no content protection");
+
+  for (guint i = 0; i < systems->len; i++)
+    moq_cp_entry_clear (&g_array_index (systems, MoqCpEntry, i));
+  g_array_free (systems, TRUE);
+}
+
+/* Flatten cp_entries into the array moq_media_sender_cfg_t wants. libmoq
+ * deep-copies every field at attach, so both blocks are freed by the caller
+ * straight after. *kids_out holds one single-element defaultKID array per
+ * entry -- CMSF allows several KIDs per entry, but one init segment declares
+ * exactly one tenc default_KID. */
+static moq_cmsf_content_protection_t *
+gst_moq_sink_cp_array (GstMoqSink *self, moq_bytes_t **kids_out, size_t *n_out)
+{
+  guint n = self->cp_entries ? self->cp_entries->len : 0;
+  *n_out = n;
+  *kids_out = NULL;
+  if (n == 0)
+    return NULL;
+
+  moq_cmsf_content_protection_t *cps =
+      g_new0 (moq_cmsf_content_protection_t, n);
+  moq_bytes_t *kids = g_new0 (moq_bytes_t, n);
+
+  for (guint i = 0; i < n; i++) {
+    MoqCpEntry *e = &g_array_index (self->cp_entries, MoqCpEntry, i);
+    kids[i].data = (const uint8_t *) e->kid_uuid;
+    kids[i].len = strlen (e->kid_uuid);
+
+    cps[i].ref_id.data = (const uint8_t *) e->ref_id;
+    cps[i].ref_id.len = strlen (e->ref_id);
+    cps[i].default_kids = &kids[i];
+    cps[i].default_kid_count = 1;
+    cps[i].scheme.data = (const uint8_t *) e->scheme;
+    cps[i].scheme.len = strlen (e->scheme);
+    cps[i].drm_system.system_id.data = (const uint8_t *) e->system_id;
+    cps[i].drm_system.system_id.len = strlen (e->system_id);
+    if (e->la_url) {
+      cps[i].drm_system.la_url.present = true;
+      cps[i].drm_system.la_url.url.data = (const uint8_t *) e->la_url;
+      cps[i].drm_system.la_url.url.len = strlen (e->la_url);
+    }
+    if (e->cert_url) {
+      cps[i].drm_system.cert_url.present = true;
+      cps[i].drm_system.cert_url.url.data = (const uint8_t *) e->cert_url;
+      cps[i].drm_system.cert_url.url.len = strlen (e->cert_url);
+    }
+    if (e->auth_url) {
+      cps[i].drm_system.auth_url.present = true;
+      cps[i].drm_system.auth_url.url.data = (const uint8_t *) e->auth_url;
+      cps[i].drm_system.auth_url.url.len = strlen (e->auth_url);
+    }
+    if (e->pssh) {
+      cps[i].drm_system.has_pssh = true;
+      cps[i].drm_system.pssh.data = (const uint8_t *) e->pssh;
+      cps[i].drm_system.pssh.len = strlen (e->pssh);
+    }
+    if (e->robustness) {
+      cps[i].drm_system.has_robustness = true;
+      cps[i].drm_system.robustness.data = (const uint8_t *) e->robustness;
+      cps[i].drm_system.robustness.len = strlen (e->robustness);
+    }
+  }
+  *kids_out = kids;
+  return cps;
+}
+
 /* Connect the endpoint and attach the media sender. Deferred out of _start so
  * prepared tracks can be attached/added in one posted task before the first
  * sender hook; see gst_moq_sink_await_tracks. A relay that
@@ -1784,6 +2173,17 @@ gst_moq_sink_open_sender (GstMoqSink *self)
   sc.namespace_.parts = self->ns_bytes;
   sc.namespace_.count = self->ns_count;
 
+  /* CMSF 4 root contentProtections, authored by commit_tracks before the pads
+   * were registered (the track cfgs reference these entries by refID). The
+   * sender cfg carries them, so they are frozen with the rest of the initial
+   * catalog at attach. */
+  moq_bytes_t *cp_kids = NULL;
+  size_t cp_count = 0;
+  moq_cmsf_content_protection_t *cps =
+      gst_moq_sink_cp_array (self, &cp_kids, &cp_count);
+  sc.content_protections = cps;
+  sc.content_protection_count = cp_count;
+
   SenderStartup task = { 0 };
   g_mutex_init (&task.lock);
   g_cond_init (&task.cond);
@@ -1830,12 +2230,23 @@ gst_moq_sink_open_sender (GstMoqSink *self)
   }
   g_cond_clear (&task.cond);
   g_mutex_clear (&task.lock);
+  /* libmoq deep-copies every contentProtections field at attach, and the wait
+   * above has settled the task, so the attach has either happened or been
+   * abandoned. Safe to drop the authored arrays either way. */
+  g_free (cps);
+  g_free (cp_kids);
   if (rc != MOQ_OK) {
     GST_ELEMENT_ERROR (self, RESOURCE, OPEN_WRITE,
-        ("could not prepare MoQ sender (rc=%d)", (int) rc), (NULL));
+        ("could not prepare MoQ sender (rc=%d)%s", (int) rc,
+            cp_count ? " -- check drm-systems: a systemID must be a "
+            "\"8-4-4-4-12\" UUID string" : ""), (NULL));
     gst_moq_sink_ready_diagnostic_free (diagnostic);
     goto fail_ns;
   }
+  if (cp_count)
+    GST_INFO_OBJECT (self, "catalog carries %" G_GSIZE_FORMAT
+        " contentProtections entr%s", (gsize) cp_count,
+        cp_count == 1 ? "y" : "ies");
   g_mutex_lock (&self->send_lock);
   self->sender = sender;
   self->ready_diagnostic = diagnostic;
@@ -1905,6 +2316,9 @@ gst_moq_sink_stop (GstMoqSink *self)
   g_clear_pointer (&self->ns_tokens, g_strfreev);
   g_clear_pointer (&self->ns_bytes, g_free);
   self->ns_count = 0;
+  g_mutex_lock (&self->track_lock);
+  gst_moq_sink_clear_content_protections (self);
+  g_mutex_unlock (&self->track_lock);
   self->started = FALSE;
   GST_INFO_OBJECT (self, "stopped");
 }
@@ -2031,6 +2445,10 @@ gst_moq_sink_set_property (GObject *object, guint prop_id,
     case PROP_LOC_AUDIO_GROUP_MS:
       self->loc_audio_group_ms = g_value_get_uint (value);
       break;
+    case PROP_DRM_SYSTEMS:
+      g_free (self->drm_systems);
+      self->drm_systems = g_value_dup_string (value);
+      break;
     case PROP_MAX_FRAGMENT_SIZE:
       self->max_fragment_size = g_value_get_uint64 (value);
       break;
@@ -2090,6 +2508,9 @@ gst_moq_sink_get_property (GObject *object, guint prop_id,
     case PROP_LOC_AUDIO_GROUP_MS:
       g_value_set_uint (value, self->loc_audio_group_ms);
       break;
+    case PROP_DRM_SYSTEMS:
+      g_value_set_string (value, self->drm_systems);
+      break;
     case PROP_MAX_FRAGMENT_SIZE:
       g_value_set_uint64 (value, self->max_fragment_size);
       break;
@@ -2106,6 +2527,10 @@ gst_moq_sink_finalize (GObject *object)
   g_free (self->relay_path);
   g_free (self->namespace_str);
   g_free (self->codec);
+  g_free (self->drm_systems);
+  gst_moq_sink_clear_content_protections (self);
+  if (self->cp_entries)
+    g_array_free (self->cp_entries, TRUE);
   g_mutex_clear (&self->send_lock);
   g_mutex_clear (&self->track_lock);
   g_cond_clear (&self->track_cond);
@@ -2200,6 +2625,27 @@ gst_moq_sink_class_init (GstMoqSinkClass *klass)
           "subscriber first.",
           1, G_MAXUINT, LOC_AUDIO_GROUP_US / 1000,
           G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+  g_object_class_install_property (gobject_class, PROP_DRM_SYSTEMS,
+      g_param_spec_string ("drm-systems", "DRM systems",
+          "DRM systems to advertise for CENC-encrypted CMAF tracks, as the "
+          "catalog's CMSF root contentProtections (CMSF 4.1.1). Semicolon "
+          "separates systems; within one, the first field is the systemID UUID "
+          "and the rest are optional key=value fields: laurl, certurl, authurl, "
+          "pssh (base64), robustness. Values may not contain ';' or ','.\n"
+          "The scheme and defaultKID are NOT configured here -- they are read "
+          "from the init segment's own sinf/schm/schi(tenc) boxes, so this "
+          "carries only what an fMP4 cannot: which systems the stream is "
+          "offered under and how to reach their licences. One entry is authored "
+          "per (scheme, KID, system), and a protected track references every "
+          "entry for its key.\n"
+          "Example: "
+          "\"edef8ba9-79d6-4ace-a3c8-27dcd51d21ed,laurl=https://lic/wv,"
+          "pssh=AAAA...;9a04f079-9840-4286-ab92-e65be0885f95,"
+          "laurl=https://lic/pr\".\n"
+          "LOC tracks are unaffected: LOC carries no CENC metadata. Leaving "
+          "this unset while a track IS encrypted publishes ciphertext with no "
+          "way to obtain a key, and is warned about.",
+          NULL, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
   g_object_class_install_property (gobject_class, PROP_MAX_FRAGMENT_SIZE,
       g_param_spec_uint64 ("max-fragment-size", "Max fragment size",
           "Largest single ISO BMFF box accepted on a CMAF pad (bytes)",

@@ -56,6 +56,7 @@ gst_moq_sink_pad_finalize (GObject *object)
   g_clear_pointer (&pad->pend_codec, g_free);
   g_clear_pointer (&pad->pend_avcc, g_bytes_unref);
   g_clear_pointer (&pad->pend_chan, g_free);
+  g_clear_pointer (&pad->pend_cp_ref_ids, g_strfreev);
   G_OBJECT_CLASS (gst_moq_sink_pad_parent_class)->finalize (object);
 }
 
@@ -101,6 +102,7 @@ gst_moq_sink_pad_reset (GstMoqSinkPad *pad)
   g_clear_pointer (&pad->pend_codec, g_free);
   g_clear_pointer (&pad->pend_avcc, g_bytes_unref);
   g_clear_pointer (&pad->pend_chan, g_free);
+  g_clear_pointer (&pad->pend_cp_ref_ids, g_strfreev);
   gsize max_box = pad->splitter.max_box;
   gst_moq_fmp4_splitter_clear (&pad->splitter);
   gst_moq_fmp4_splitter_init (&pad->splitter, max_box);

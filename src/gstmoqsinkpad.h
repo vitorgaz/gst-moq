@@ -51,9 +51,14 @@ struct _GstMoqSinkPad
    * before the session establishes -- otherwise a pad whose caps arrive late is
    * absent from the initial catalog (see gst_moq_sink_await_tracks). */
   gboolean pend_ready;
-  gchar   *pend_codec;                /* LOC: codec string (owned) */
+  gchar   *pend_codec;                /* codec string (owned) */
   GBytes  *pend_avcc;                 /* LOC video: avcC (owned) */
   gchar   *pend_chan;                 /* LOC audio: channelConfig (owned) */
+  /* CMAF: this track's CMSF contentProtectionRefIDs (CMSF 4.1.2), resolved at
+   * the barrier from the init segment's CENC boxes and the element's
+   * drm-systems. NULL-terminated and owned; NULL when the track is not
+   * encrypted, or when it is but no DRM system is configured to describe it. */
+  gchar  **pend_cp_ref_ids;
 
   /* CMAF (request pads) */
   GstMoqFmp4Splitter   splitter;

@@ -1,0 +1,30 @@
+[workspace]
+members = [".", "moq-sys"]
+resolver = "3"
+
+[package]
+name = "gst-moq"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.92"
+license = "Apache-2.0"
+description = "Media over QUIC elements backed by MOQ5"
+repository = "https://github.com/openmoq/moq5"
+
+[lib]
+name = "gstmoq"
+crate-type = ["cdylib", "rlib"]
+path = "src/lib.rs"
+
+[[bin]]
+# Offline fixture inventory through the plugin splitter and the SDK parser.
+name = "inspect_cmaf_fixture"
+path = "src/bin/inspect_cmaf_fixture.rs"
+
+[dependencies]
+gst = { package = "gstreamer", version = "0.25", features = ["v1_22"] }
+gst-base = { package = "gstreamer-base", version = "0.25", features = ["v1_22"] }
+moq-sys = { path = "moq-sys" }
+
+[profile.release]
+lto = "thin"

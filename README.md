@@ -20,22 +20,47 @@ service tier.
 
 ## Build
 
-Requires the GStreamer 1.x development packages (`gstreamer-1.0`,
-`gstreamer-base-1.0`) and an installed MOQ5 with the service component
-(`libmoq-service` / `moq::service`).
+The plugin is written in Rust on [gstreamer-rs](https://gitlab.freedesktop.org/gstreamer/gstreamer-rs).
+It requires Rust 1.92 or newer, the GStreamer 1.x development packages
+(`gstreamer-1.0`, `gstreamer-base-1.0`, 1.22 or newer), libclang (the
+`moq-sys` crate generates its libmoq bindings with bindgen), and an installed
+MOQ5 with the service component (`libmoq-service`).
 
-On Linux the plugin is a shared object, so every static library it links
-(picotls, picoquic, libmoq) must be built position-independent
-(`-DCMAKE_POSITION_INDEPENDENT_CODE=ON`). Install picoquic (with `BUILD_HTTP=ON`
-for WebTransport) and libmoq into one prefix, then point CMake at it:
+`moq-sys` links the static libmoq archives from `$MOQ_PREFIX/lib` and reads
+the headers from `$MOQ_PREFIX/include`; `MOQ_PREFIX` defaults to
+`../local-prefix` next to this repository. On Linux the plugin is a shared
+object, so every static library it links must be built position-independent
+(`-DCMAKE_POSITION_INDEPENDENT_CODE=ON`). If your libmoq build references
+further static libraries (picoquic, picotls, OpenSSL), name them in
+`MOQ_EXTRA_LIBS` (space-separated `cargo:rustc-link-lib` values, e.g.
+`"static=picoquic-core static=picotls-core ssl crypto"`); they are searched in
+the same `lib` directory.
 
 ```sh
-cmake -B build -DCMAKE_PREFIX_PATH=<moq5-prefix>   # auto-found at ../local-prefix
-cmake --build build
-export GST_PLUGIN_PATH="$PWD/build/plugins"
+cargo build --release                 # MOQ_PREFIX=<moq5-prefix> if not ../local-prefix
+export GST_PLUGIN_PATH="$PWD/target/release"
 gst-inspect-1.0 moqsink
 gst-inspect-1.0 moqsrc
 ```
+
+## Test
+
+```sh
+cargo test
+```
+
+runs, with no relay and no sockets:
+
+- unit tests for the fMP4 splitter and the codec strings;
+- the element suites (`moqsink` track barrier and content protection,
+  `moqsink` EOS/flush recovery, `moqsrc` delivery), which drive the real
+  element code with the libmoq service calls replaced by mocks;
+- `tests/smoke.sh` against a freshly built plugin (inspection, a CMAF publish
+  pipeline against a refused relay, a `moqsink` state cycle), plus its
+  socket-free guard tests in `tests/test_smoke_guards.py`.
+
+`cargo run --bin inspect_cmaf_fixture -- file.mp4` prints the init/fragment
+inventory of a fragmented MP4 as the plugin splits and libmoq parses it.
 
 ## Usage
 

@@ -10,6 +10,10 @@ changed to make playback work end to end.
 
 ## 1. Building against MOQ5 on Linux
 
+> The plugin has since been ported from C/CMake to Rust/Cargo; see the README
+> for the current build (`MOQ_PREFIX`, `MOQ_EXTRA_LIBS`). The CMake steps below
+> are kept as the record of this session.
+
 The plugin is a shared object (`libgstmoq.so`) that links three static
 libraries: picotls, picoquic and libmoq. All three must be compiled with
 `-fPIC`. The regular MOQ5 tree (`moq5/build/dev`) is not, and linking against

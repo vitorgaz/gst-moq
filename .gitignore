@@ -3,3 +3,4 @@
 /test/*.pem
 /compile_commands.json
 /.cache/
+/target/

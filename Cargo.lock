@@ -232,7 +232,7 @@ version = "0.1.0"
 dependencies = [
  "gstreamer",
  "gstreamer-base",
- "moq-sys",
+ "moq5",
 ]
 
 [[package]]
@@ -384,8 +384,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "68354c5c6bd36d73ff3feceb05efa59b6acb7626617f4962be322a825e61f79a"
 
 [[package]]
-name = "moq-sys"
+name = "moq5"
 version = "0.1.0"
+source = "git+https://github.com/vitorgaz/moq5?rev=b160ca1964acd68d637322d0f6ae6070ceb5f06f#b160ca1964acd68d637322d0f6ae6070ceb5f06f"
+dependencies = [
+ "moq5-sys",
+]
+
+[[package]]
+name = "moq5-sys"
+version = "0.1.0"
+source = "git+https://github.com/vitorgaz/moq5?rev=b160ca1964acd68d637322d0f6ae6070ceb5f06f#b160ca1964acd68d637322d0f6ae6070ceb5f06f"
 dependencies = [
  "bindgen",
 ]

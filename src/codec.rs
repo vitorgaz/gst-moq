@@ -1,23 +1,22 @@
 //! MSF catalog codec strings.
 
-use crate::moq::*;
+use moq5::cmaf::{CodecKind, InitInfo};
 
 /// MSF codec string for a parsed CMAF init segment: "avc1.PPCCLL",
 /// "mp4a.40.<aot>" or "opus". `None` for codecs this plugin does not publish
 /// (HEVC, AV1) or when the codec config is too short to read.
-pub fn codec_string_from_init(info: &moq_cmaf_init_info_t) -> Option<String> {
-    // SAFETY: codec_config borrows the init segment the info was parsed from.
-    let d = unsafe { bytes(info.codec_config) };
-    match info.codec_kind {
-        MOQ_CMAF_CODEC_AVC => {
+pub fn codec_string_from_init(info: InitInfo<'_>) -> Option<String> {
+    let d = info.codec_config();
+    match info.codec_kind() {
+        CodecKind::Avc => {
             // AVCDecoderConfigurationRecord: version, profile, compat, level
             if d.len() < 4 || d[0] != 1 {
                 return None;
             }
             Some(format!("avc1.{:02x}{:02x}{:02x}", d[1], d[2], d[3]))
         }
-        MOQ_CMAF_CODEC_AAC => codec_string_from_aac_asc(d),
-        MOQ_CMAF_CODEC_OPUS => Some("opus".into()),
+        CodecKind::Aac => codec_string_from_aac_asc(d),
+        CodecKind::Opus => Some("opus".into()),
         _ => None,
     }
 }
@@ -63,6 +62,14 @@ pub fn aac_asc_params(asc: &[u8]) -> Option<(i32, i32)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::span;
+    use moq5::sys::*;
+
+    /// The codec string of a hand-built init info.
+    fn codec_of(i: &moq_cmaf_init_info_t) -> Option<String> {
+        // SAFETY: the spans point at the test's arrays, alive for the call.
+        codec_string_from_init(unsafe { InitInfo::from_raw(i) })
+    }
 
     fn info(kind: moq_cmaf_codec_kind_t, config: &[u8]) -> moq_cmaf_init_info_t {
         let mut i = moq_cmaf_init_info_t::default();
@@ -77,7 +84,7 @@ mod tests {
         // avcC: version 1, profile 0x42, compat 0xc0, level 0x1e, ...
         let avcc = [1, 0x42, 0xc0, 0x1e, 0xff, 0xe1];
         let i = info(MOQ_CMAF_CODEC_AVC, &avcc);
-        assert_eq!(codec_string_from_init(&i).as_deref(), Some("avc1.42c01e"));
+        assert_eq!(codec_of(&i).as_deref(), Some("avc1.42c01e"));
     }
 
     #[test]
@@ -85,7 +92,7 @@ mod tests {
         // AudioSpecificConfig: AOT 2 (AAC-LC) = 00010 in the top 5 bits -> 0x12 0x10
         let asc = [0x12, 0x10];
         let i = info(MOQ_CMAF_CODEC_AAC, &asc);
-        assert_eq!(codec_string_from_init(&i).as_deref(), Some("mp4a.40.2"));
+        assert_eq!(codec_of(&i).as_deref(), Some("mp4a.40.2"));
     }
 
     #[test]
@@ -93,24 +100,24 @@ mod tests {
         // AOT 5 (SBR) = 00101 -> 0x2a
         let asc = [0x2a, 0x10];
         let i = info(MOQ_CMAF_CODEC_AAC, &asc);
-        assert_eq!(codec_string_from_init(&i).as_deref(), Some("mp4a.40.5"));
+        assert_eq!(codec_of(&i).as_deref(), Some("mp4a.40.5"));
     }
 
     #[test]
     fn opus() {
         let i = info(MOQ_CMAF_CODEC_OPUS, &[]);
-        assert_eq!(codec_string_from_init(&i).as_deref(), Some("opus"));
+        assert_eq!(codec_of(&i).as_deref(), Some("opus"));
     }
 
     #[test]
     fn unsupported() {
         let i = info(MOQ_CMAF_CODEC_HEVC, &[]);
-        assert_eq!(codec_string_from_init(&i), None);
+        assert_eq!(codec_of(&i), None);
 
         // AVC with a truncated avcC
         let short_avcc = [1, 0x42];
         let i = info(MOQ_CMAF_CODEC_AVC, &short_avcc);
-        assert_eq!(codec_string_from_init(&i), None);
+        assert_eq!(codec_of(&i), None);
     }
 
     #[test]

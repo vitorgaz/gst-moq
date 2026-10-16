@@ -11,11 +11,10 @@
 //! no LOC parsing in this element -- the receiver delivers parsed timing and
 //! keyframe flags.
 //!
-//! Copy semantics: a polled object transfers exclusive ownership of its
-//! backing buffers to us until moq_media_object_cleanup(), which the service
-//! permits on the polling thread. We COPY the payload into a GstBuffer and
-//! clean the object up immediately, so no libmoq rcbuf is ever freed on an
-//! arbitrary downstream thread.
+//! Copy semantics: a polled object owns its backing buffers until it is
+//! dropped, which must happen on the polling thread (MediaObject is not
+//! Send). We COPY the payload into a GstBuffer and drop the object at once,
+//! so no libmoq rcbuf is ever freed on an arbitrary downstream thread.
 //!
 //! Topology: the service endpoint is a CLIENT. moqsrc and moqsink both dial
 //! a relay (e.g. moqx over WebTransport) rather than each other.
@@ -38,11 +37,17 @@ use gst_base::prelude::*;
 use gst_base::subclass::base_src::CreateSuccess;
 use gst_base::subclass::prelude::*;
 
-use std::sync::atomic::{AtomicPtr, Ordering};
 use std::sync::{LazyLock, Mutex, MutexGuard};
+use std::time::Duration;
+
+use moq5::sys::{MOQ_DONE, MOQ_ERR_CLOSED, MOQ_ERR_INTERRUPTED, MOQ_OK};
+use moq5::{
+    Endpoint, Error, MediaReceiver, Namespace, Packaging, ReceiverConfig, ReceiverTrack,
+    TerminalReason, TrackDesc, TrackEventKind,
+};
 
 use crate::clock;
-use crate::moq::*;
+use crate::moq::{endpoint_config, relay_url};
 
 pub(crate) static CAT: LazyLock<gst::DebugCategory> = LazyLock::new(|| {
     gst::DebugCategory::new("moqsrc", gst::DebugColorFlags::empty(), Some("MoQ source"))
@@ -93,23 +98,20 @@ impl Default for Settings {
 
 #[derive(Default)]
 pub(crate) struct State {
-    pub(crate) receiver: Handle<moq_media_receiver_t>,
-    /// handle matching track-name, or null
-    pub(crate) want_track: Handle<moq_media_track_t>,
+    /// holds the endpoint too, so it is destroyed before the endpoint stops
+    pub(crate) receiver: Option<MediaReceiver>,
+    /// handle matching track-name, if any
+    pub(crate) want_track: Option<ReceiverTrack>,
     pub(crate) want_track_ended: bool,
     pub(crate) selection_failed: bool,
     pub(crate) started: bool,
     pub(crate) caps_pushed: bool,
     pub(crate) catalog_ready: bool,
 
-    /// namespace parts (stable while the receiver lives)
-    pub(crate) namespace: Option<Namespace>,
-
     pub(crate) objects_recv: u64,
 
-    /// wanted-track descriptor snapshot (valid while the receiver lives):
-    /// the CMAF init segment from the catalog
-    pub(crate) want_init: ForeignSpan,
+    /// the wanted track's CMAF init segment, copied from the catalog
+    pub(crate) want_init: Vec<u8>,
     pub(crate) init_pushed: bool,
     /// fragment held back behind the init
     pub(crate) pending: Option<gst::Buffer>,
@@ -137,55 +139,43 @@ pub struct MoqSrc {
     pub(crate) state: Mutex<State>,
     /// The endpoint, outside `state` so unlock() can interrupt a create()
     /// that is blocked in a receiver wait while holding the state lock.
-    pub(crate) ep: AtomicPtr<moq_endpoint_t>,
+    pub(crate) ep: Mutex<Option<Endpoint>>,
 }
 
-fn starts_with(span: moq_bytes_t, prefix: &[u8]) -> bool {
-    // SAFETY: descriptor spans are valid while the receiver lives.
-    unsafe { bytes(span) }.starts_with(prefix)
-}
-
-fn lossy(span: moq_bytes_t) -> String {
-    // SAFETY: as above.
-    String::from_utf8_lossy(unsafe { bytes(span) }).into_owned()
+fn lossy(b: &[u8]) -> String {
+    String::from_utf8_lossy(b).into_owned()
 }
 
 impl MoqSrc {
-    fn ep(&self) -> *mut moq_endpoint_t {
-        self.ep.load(Ordering::SeqCst)
+    fn endpoint(&self) -> Option<Endpoint> {
+        self.ep.lock().unwrap().clone()
     }
 
     pub(crate) fn lock_state(&self) -> MutexGuard<'_, State> {
         self.state.lock().unwrap()
     }
 
-    fn log_terminal(&self) {
-        let mut terminal = moq_endpoint_terminal_t::default();
-        let rc = unsafe {
-            moq_endpoint_get_terminal(self.ep(), &mut terminal, std::mem::size_of_val(&terminal))
-        };
-        if rc != MOQ_OK {
-            gst::info!(
+    fn log_terminal(&self, ep: &Endpoint) {
+        match ep.terminal() {
+            Err(e) => gst::info!(
                 CAT,
                 imp = self,
                 "endpoint terminal unavailable getter_rc={}",
-                rc
-            );
-        } else if terminal.reason == MOQ_ENDPOINT_TERMINAL_NONE {
-            gst::info!(
+                e.code()
+            ),
+            Ok(t) if t.reason == TerminalReason::None => gst::info!(
                 CAT,
                 imp = self,
                 "endpoint terminal unclassified reason=0 detail={}",
-                terminal.detail_code
-            );
-        } else {
-            gst::info!(
+                t.detail_code
+            ),
+            Ok(t) => gst::info!(
                 CAT,
                 imp = self,
                 "endpoint terminal reason={} detail={}",
-                terminal.reason,
-                terminal.detail_code
-            );
+                t.reason.code(),
+                t.detail_code
+            ),
         }
     }
 
@@ -230,94 +220,97 @@ impl MoqSrc {
             let s = self.settings.lock().unwrap();
             (s.track_name.clone(), s.caps.clone())
         };
-        let mut ev = moq_media_track_event_t::default();
-        while unsafe {
-            moq_media_receiver_poll_track(st.receiver.get(), &mut ev, std::mem::size_of_val(&ev))
-        } == MOQ_OK
-        {
-            match ev.kind {
-                MOQ_MEDIA_TRACK_ADDED => {
-                    // SAFETY: descriptors stay valid until receiver teardown.
-                    let d = unsafe { ev.desc.as_ref() };
+        let Some(receiver) = st.receiver.as_ref() else {
+            return;
+        };
+        while let Ok(Some(ev)) = receiver.poll_track() {
+            match ev.kind() {
+                TrackEventKind::Added => {
+                    let d = ev.desc();
                     gst::info!(
                         CAT,
                         imp = self,
                         "TRACK_ADDED name={} codec={} packaging={}",
-                        d.map(|d| lossy(d.name)).unwrap_or_default(),
-                        d.map(|d| lossy(d.codec)).unwrap_or_default(),
-                        if d.is_some_and(|d| d.info.packaging == MOQ_MEDIA_PACKAGING_CMAF) {
+                        d.map(|d| lossy(d.name())).unwrap_or_default(),
+                        d.map(|d| lossy(d.codec())).unwrap_or_default(),
+                        if d.is_some_and(|d| d.packaging() == Some(Packaging::Cmaf)) {
                             "cmaf"
                         } else {
                             "loc"
                         }
                     );
                     let Some(d) = d else { continue };
-                    if st.want_track.is_null() {
+                    if st.want_track.is_none() {
                         if let Some(seen) = st.seen_tracks.as_mut() {
                             if !seen.is_empty() {
                                 seen.push_str(", ");
                             }
-                            seen.push_str(&lossy(d.name));
+                            seen.push_str(&lossy(d.name()));
                         }
                     }
-                    let name = unsafe { bytes(d.name) };
-                    if d.name.data.is_null()
-                        || !st.want_track.is_null()
-                        || name != track_name.as_bytes()
+                    if d.raw().name.data.is_null()
+                        || st.want_track.is_some()
+                        || d.name() != track_name.as_bytes()
                     {
                         continue;
                     }
-                    let rc = unsafe {
-                        moq_media_receiver_subscribe_track(
-                            st.receiver.get(),
-                            ev.track,
-                            std::ptr::null(),
-                        )
+                    let subscribed = match ev.track() {
+                        Some(t) => receiver.subscribe_track(t, None).map(|()| t),
+                        None => Err(Error::INVAL),
                     };
-                    if rc != MOQ_OK {
-                        gst::element_imp_error!(
-                            self,
-                            gst::ResourceError::Read,
-                            (
-                                "could not subscribe to track \"{}\" (rc={})",
-                                track_name,
-                                rc
-                            )
-                        );
-                        st.selection_failed = true;
-                        continue;
-                    }
+                    let track = match subscribed {
+                        Ok(t) => t,
+                        Err(e) => {
+                            gst::element_imp_error!(
+                                self,
+                                gst::ResourceError::Read,
+                                (
+                                    "could not subscribe to track \"{}\" (rc={})",
+                                    track_name,
+                                    e.code()
+                                )
+                            );
+                            st.selection_failed = true;
+                            continue;
+                        }
+                    };
                     gst::info!(
                         CAT,
                         imp = self,
                         "selected endpoint negotiated draft={}",
-                        unsafe { moq_endpoint_negotiated_version(self.ep()) }
+                        receiver
+                            .endpoint()
+                            .negotiated_version()
+                            .map_or(0, |v| v.draft())
                     );
-                    st.want_track = Handle(ev.track);
+                    st.want_track = Some(track);
                     st.want_track_ended = false;
                     st.track_ever_seen = true;
-                    st.want_init = ForeignSpan(d.init_data);
+                    st.want_init = d.init_data().to_vec();
                     st.init_pushed = false;
-                    if d.info.packaging == MOQ_MEDIA_PACKAGING_RAW && starts_with(d.codec, b"mp4a")
-                    {
-                        st.want_init = ForeignSpan::default();
+                    if d.packaging() == Some(Packaging::Loc) && d.codec().starts_with(b"mp4a") {
+                        st.want_init.clear();
                     }
                     if caps.as_ref().is_none_or(|c| c.is_any()) {
-                        let c = if d.info.packaging == MOQ_MEDIA_PACKAGING_CMAF {
+                        let c = if d.packaging() == Some(Packaging::Cmaf) {
                             Some(
                                 gst::Caps::builder("video/quicktime")
                                     .field("variant", "iso")
                                     .build(),
                             )
-                        } else if starts_with(d.codec, b"avc1") || starts_with(d.codec, b"avc3") {
+                        } else if d.codec().starts_with(b"avc1") || d.codec().starts_with(b"avc3") {
                             Some(
                                 gst::Caps::builder("video/x-h264")
                                     .field("stream-format", "byte-stream")
                                     .field("alignment", "au")
                                     .build(),
                             )
-                        } else if starts_with(d.codec, b"mp4a") {
-                            Some(self.loc_aac_caps(st, d))
+                        } else if d.codec().starts_with(b"mp4a") {
+                            // The catalog init is the codec_data, not a media
+                            // object: pushing it downstream would look like an
+                            // AAC frame.
+                            st.want_init.clear();
+                            Some(Self::loc_aac_caps(d))
                         } else {
                             gst::element_imp_error!(
                                 self,
@@ -325,7 +318,7 @@ impl MoqSrc {
                                 (
                                     "track \"{}\" is a LOC track with codec {}; set the \"caps\" property for it",
                                     track_name,
-                                    lossy(d.codec)
+                                    lossy(d.codec())
                                 )
                             );
                             st.negotiation_failed = true;
@@ -336,14 +329,14 @@ impl MoqSrc {
                         }
                     }
                 }
-                MOQ_MEDIA_TRACK_ENDED | MOQ_MEDIA_TRACK_REMOVED => {
-                    if !ev.track.is_null() && Handle(ev.track) == st.want_track {
+                TrackEventKind::Ended | TrackEventKind::Removed => {
+                    if ev.track().is_some() && ev.track() == st.want_track {
                         st.want_track_ended = true;
                         gst::info!(
                             CAT,
                             imp = self,
                             "selected-track terminal event kind={} name={}",
-                            ev.kind,
+                            ev.raw().kind,
                             track_name
                         );
                         // Handles and descriptors remain stable until receiver
@@ -351,7 +344,7 @@ impl MoqSrc {
                         // after removal too.
                     }
                 }
-                MOQ_MEDIA_CATALOG_READY => {
+                TrackEventKind::CatalogReady => {
                     st.catalog_ready = true;
                     gst::info!(CAT, imp = self, "CATALOG_READY");
                 }
@@ -363,17 +356,17 @@ impl MoqSrc {
     /// LOC audio: raw AAC access units. The decoder config travels in the
     /// catalog, so it becomes codec_data rather than a pushed init segment --
     /// unlike CMAF, where qtdemux reads it from the moov.
-    fn loc_aac_caps(&self, st: &mut State, d: &moq_media_track_desc_t) -> gst::Caps {
+    fn loc_aac_caps(d: TrackDesc<'_>) -> gst::Caps {
         let mut b = gst::Caps::builder("audio/mpeg")
             .field("mpegversion", 4i32)
             .field("stream-format", "raw");
-        if d.has_samplerate && d.samplerate != 0 {
-            b = b.field("rate", d.samplerate as i32);
+        if let Some(rate) = d.samplerate().filter(|&r| r != 0) {
+            b = b.field("rate", rate as i32);
         }
         // channelConfig is a catalog span, not a C string, so it is parsed
         // bounded rather than with atoi().
         let mut ch: i32 = 0;
-        for &ci in unsafe { bytes(d.channel_config) } {
+        for &ci in d.channel_config() {
             if ch >= 256 {
                 break;
             }
@@ -388,18 +381,15 @@ impl MoqSrc {
         }
         // Prefer the parsed decoder extradata; fall back to the raw initData
         // the publisher sent (they are the same ASC here).
-        let asc = if d.init.codec_config.len != 0 {
-            d.init.codec_config
+        let config = d.init_info().codec_config();
+        let asc = if config.is_empty() {
+            d.init_data()
         } else {
-            d.init_data
+            config
         };
-        let asc = unsafe { bytes(asc) };
         if !asc.is_empty() {
             b = b.field("codec_data", gst::Buffer::from_slice(asc.to_vec()));
         }
-        // The catalog init is the codec_data above, not a media object:
-        // pushing it downstream would look like an AAC frame.
-        st.want_init = ForeignSpan::default();
         b.build()
     }
 
@@ -435,27 +425,26 @@ impl MoqSrc {
                 }
             }
 
-            let mut obj = moq_media_object_t::default();
-            let rc = unsafe {
-                moq_media_receiver_poll_object(
-                    st.receiver.get(),
-                    &mut obj,
-                    std::mem::size_of_val(&obj),
-                )
+            let Some(receiver) = st.receiver.as_ref() else {
+                return Err(gst::FlowError::Flushing);
+            };
+            let polled = receiver.poll_object();
+            let rc = match &polled {
+                Ok(Some(_)) => MOQ_OK,
+                Ok(None) => MOQ_DONE, // nothing queued now
+                Err(e) => e.code(),
             };
 
             if rc == MOQ_ERR_INTERRUPTED {
                 return Err(gst::FlowError::Flushing);
             }
 
-            if st.want_track.is_null()
+            if st.want_track.is_none()
                 && !st.track_ever_seen
                 && (rc == MOQ_OK || rc == MOQ_DONE)
                 && clock::monotonic_us() >= st.discover_deadline
             {
-                if rc == MOQ_OK {
-                    unsafe { moq_media_object_cleanup(&mut obj) };
-                }
+                drop(polled);
                 let seen = st
                     .seen_tracks
                     .as_deref()
@@ -474,30 +463,27 @@ impl MoqSrc {
                 return Err(gst::FlowError::Error);
             }
 
-            if rc == MOQ_OK {
+            if let Ok(Some(obj)) = polled {
                 // Every object's track is announced before it is pollable, so
-                // a null want_track here means the requested track-name has
+                // a missing want_track here means the requested track-name has
                 // not matched anything yet -- drop until it resolves (or the
                 // discovery deadline fails the pipeline) rather than guessing
                 // at an unrelated track.
-                if st.want_track.is_null() || Handle(obj.track) != st.want_track {
-                    unsafe { moq_media_object_cleanup(&mut obj) };
+                if st.want_track.is_none() || obj.track() != st.want_track {
                     continue;
                 }
                 if !st.caps_pushed {
                     // object before caps: not usable
-                    unsafe { moq_media_object_cleanup(&mut obj) };
                     continue;
                 }
 
-                if obj.packaging == MOQ_MEDIA_PACKAGING_CMAF {
-                    if obj.fragment.len == 0 {
+                if obj.packaging() == Some(Packaging::Cmaf) {
+                    if obj.fragment().is_empty() {
                         gst::warning!(CAT, imp = self, "CMAF object with empty fragment, skipping");
-                        unsafe { moq_media_object_cleanup(&mut obj) };
                         continue;
                     }
-                    let mut buf = gst::Buffer::from_slice(unsafe { bytes(obj.fragment) }.to_vec());
-                    if !obj.keyframe {
+                    let mut buf = gst::Buffer::from_slice(obj.fragment().to_vec());
+                    if !obj.is_keyframe() {
                         buf.get_mut()
                             .unwrap()
                             .set_flags(gst::BufferFlags::DELTA_UNIT);
@@ -507,10 +493,10 @@ impl MoqSrc {
                         CAT,
                         imp = self,
                         "received CMAF {} fragment ({} B)",
-                        if obj.keyframe { "sync" } else { "delta" },
-                        obj.fragment.len
+                        if obj.is_keyframe() { "sync" } else { "delta" },
+                        obj.fragment().len()
                     );
-                    unsafe { moq_media_object_cleanup(&mut obj) };
+                    drop(obj);
 
                     if !st.init_pushed {
                         if st.want_init.is_empty() {
@@ -524,9 +510,7 @@ impl MoqSrc {
                             );
                             return Err(gst::FlowError::Error);
                         }
-                        // SAFETY: the descriptor outlives this receiver poll.
-                        let mut init =
-                            gst::Buffer::from_slice(unsafe { st.want_init.as_slice() }.to_vec());
+                        let mut init = gst::Buffer::from_slice(st.want_init.clone());
                         init.get_mut().unwrap().set_flags(gst::BufferFlags::HEADER);
                         st.init_pushed = true;
                         st.pending = Some(buf); // delivered on the next create()
@@ -542,16 +526,15 @@ impl MoqSrc {
                 }
 
                 // LOC path
-                if obj.payload.len == 0 {
-                    unsafe { moq_media_object_cleanup(&mut obj) };
+                if obj.payload().is_empty() {
                     continue;
                 }
-                let mut buf = gst::Buffer::from_slice(unsafe { bytes(obj.payload) }.to_vec());
+                let mut buf = gst::Buffer::from_slice(obj.payload().to_vec());
                 {
-                    let pts = self.map_pts(st, obj.presentation_time_us);
+                    let pts = self.map_pts(st, obj.presentation_time_us());
                     let b = buf.get_mut().unwrap();
                     b.set_pts(pts);
-                    if !obj.keyframe {
+                    if !obj.is_keyframe() {
                         b.set_flags(gst::BufferFlags::DELTA_UNIT);
                     }
                 }
@@ -561,30 +544,30 @@ impl MoqSrc {
                     CAT,
                     imp = self,
                     "received {} pts={}us ({} B)",
-                    if obj.keyframe { "keyframe" } else { "delta" },
-                    obj.presentation_time_us,
-                    obj.payload.len
+                    if obj.is_keyframe() {
+                        "keyframe"
+                    } else {
+                        "delta"
+                    },
+                    obj.presentation_time_us(),
+                    obj.payload().len()
                 );
-                unsafe { moq_media_object_cleanup(&mut obj) };
                 return Ok(buf);
             }
 
-            if rc == MOQ_ERR_INTERRUPTED {
-                return Err(gst::FlowError::Flushing);
+            let receiver = st.receiver.as_ref().expect("checked above");
+            let fatal = receiver.is_fatal();
+            if rc == MOQ_ERR_CLOSED || fatal {
+                if let Some(ep) = self.endpoint() {
+                    self.log_terminal(&ep);
+                }
             }
 
-            let fatal = unsafe { moq_media_receiver_is_fatal(st.receiver.get()) };
-            if !self.ep().is_null() && (rc == MOQ_ERR_CLOSED || fatal) {
-                self.log_terminal();
-            }
-
-            if unsafe { moq_media_receiver_is_fatal(st.receiver.get()) } {
+            if fatal {
                 gst::element_imp_error!(
                     self,
                     gst::ResourceError::Read,
-                    ("media receiver failed (code={})", unsafe {
-                        moq_media_receiver_fatal_code(st.receiver.get())
-                    })
+                    ("media receiver failed (code={})", receiver.fatal_code())
                 );
                 return Err(gst::FlowError::Error);
             }
@@ -604,18 +587,16 @@ impl MoqSrc {
                 return Err(gst::FlowError::Eos);
             }
 
-            // rc == MOQ_DONE: nothing queued. Wait for the next wakeup.
-            let w = unsafe { moq_media_receiver_wait(st.receiver.get(), WAIT_TIMEOUT_US) };
-            if w == MOQ_ERR_INTERRUPTED {
+            // Nothing queued. Wait for the next wakeup.
+            if receiver.wait(Duration::from_micros(WAIT_TIMEOUT_US)) == Err(Error::INTERRUPTED) {
                 return Err(gst::FlowError::Flushing);
             }
-            // MOQ_OK (woke) / MOQ_DONE (timeout) / MOQ_ERR_CLOSED: loop; the
-            // next poll classifies terminal vs more data deterministically.
+            // Ready (woke) / TimedOut / CLOSED: loop; the next poll classifies
+            // terminal vs more data deterministically.
         }
     }
 
     fn clear_session(st: &mut State) {
-        st.namespace = None;
         st.pending = None;
         st.seen_tracks = None;
         st.derived_caps = None;
@@ -788,16 +769,16 @@ impl BaseSrcImpl for MoqSrc {
         })?;
 
         let mut st = self.lock_state();
-        st.receiver = Handle::null();
-        self.ep.store(std::ptr::null_mut(), Ordering::SeqCst);
-        st.want_track = Handle::null();
+        st.receiver = None;
+        *self.ep.lock().unwrap() = None;
+        st.want_track = None;
         st.want_track_ended = false;
         st.selection_failed = false;
         st.caps_pushed = false;
         st.catalog_ready = false;
         st.objects_recv = 0;
         st.have_anchor = false;
-        st.want_init = ForeignSpan::default();
+        st.want_init.clear();
         st.init_pushed = false;
         st.pending = None;
         st.seen_tracks = Some(String::new());
@@ -807,50 +788,40 @@ impl BaseSrcImpl for MoqSrc {
         st.discover_deadline = clock::monotonic_us() + s.discovery_timeout_ms as i64 * 1000;
 
         let url = relay_url(&s.host, s.port, &s.relay_path);
-        let pinned: moq_version_t = s.draft as moq_version_t;
-        let mut ep = std::ptr::null_mut();
-        let rc = unsafe {
-            let ec = endpoint_cfg(&url, s.insecure, s.draft, &pinned);
-            moq_endpoint_connect(&ec, &mut ep)
-        };
-        if rc != MOQ_OK {
-            Self::clear_session(&mut st);
-            return Err(gst::error_msg!(
-                gst::ResourceError::OpenRead,
-                (
-                    "could not open MoQ endpoint to relay {}:{} (rc={})",
-                    s.host,
-                    s.port,
-                    rc
-                )
-            ));
-        }
-        self.ep.store(ep, Ordering::SeqCst);
-
-        let mut rcfg = moq_media_receiver_cfg_t::default();
-        unsafe { moq_media_receiver_cfg_init_live(&mut rcfg) };
-        rcfg.endpoint = std::ptr::null(); // attach: we own the endpoint above
-        rcfg.namespace_.parts = namespace.parts();
-        rcfg.namespace_.count = namespace.count();
-        rcfg.auto_subscribe = false;
-
-        let mut receiver = std::ptr::null_mut();
-        let rc = unsafe { moq_media_receiver_attach(ep, &rcfg, &mut receiver) };
-        if rc != MOQ_OK {
-            self.log_terminal();
-            unsafe {
-                moq_endpoint_stop(ep);
-                moq_endpoint_destroy(ep);
+        let ep = match Endpoint::connect(&endpoint_config(&url, s.insecure, s.draft)) {
+            Ok(ep) => ep,
+            Err(e) => {
+                Self::clear_session(&mut st);
+                return Err(gst::error_msg!(
+                    gst::ResourceError::OpenRead,
+                    (
+                        "could not open MoQ endpoint to relay {}:{} (rc={})",
+                        s.host,
+                        s.port,
+                        e.code()
+                    )
+                ));
             }
-            self.ep.store(std::ptr::null_mut(), Ordering::SeqCst);
-            Self::clear_session(&mut st);
-            return Err(gst::error_msg!(
-                gst::ResourceError::OpenRead,
-                ("could not attach media receiver (rc={})", rc)
-            ));
-        }
-        st.receiver = Handle(receiver);
-        st.namespace = Some(namespace);
+        };
+
+        // Attach, not create: we own the endpoint above. Tracks are selected
+        // by name, so nothing is auto-subscribed.
+        let cfg = ReceiverConfig::live(namespace).auto_subscribe(false);
+        let receiver = match MediaReceiver::attach(&ep, cfg) {
+            Ok(r) => r,
+            Err(e) => {
+                self.log_terminal(&ep);
+                // The last handle: stops and destroys the endpoint.
+                drop(ep);
+                Self::clear_session(&mut st);
+                return Err(gst::error_msg!(
+                    gst::ResourceError::OpenRead,
+                    ("could not attach media receiver (rc={})", e.code())
+                ));
+            }
+        };
+        *self.ep.lock().unwrap() = Some(ep);
+        st.receiver = Some(receiver);
 
         st.started = true;
         gst::info!(
@@ -872,23 +843,17 @@ impl BaseSrcImpl for MoqSrc {
             return Ok(());
         }
 
-        let ep = self.ep();
-        if !ep.is_null() {
-            unsafe { moq_endpoint_set_interrupted(ep, true) };
+        if let Some(ep) = self.endpoint() {
+            ep.set_interrupted(true);
         }
 
-        if !st.receiver.is_null() {
-            unsafe { moq_media_receiver_destroy(st.receiver.get()) };
-            st.receiver = Handle::null();
-            st.want_track = Handle::null();
+        // The receiver goes first; dropping the last endpoint handle after it
+        // stops and destroys the endpoint.
+        if st.receiver.take().is_some() {
+            st.want_track = None;
         }
-        if !ep.is_null() {
-            unsafe {
-                moq_endpoint_stop(ep);
-                moq_endpoint_destroy(ep);
-            }
-            self.ep.store(std::ptr::null_mut(), Ordering::SeqCst);
-        }
+        let ep = self.ep.lock().unwrap().take();
+        drop(ep);
 
         st.started = false;
         Self::clear_session(&mut st);
@@ -903,17 +868,15 @@ impl BaseSrcImpl for MoqSrc {
     }
 
     fn unlock(&self) -> Result<(), gst::ErrorMessage> {
-        let ep = self.ep();
-        if !ep.is_null() {
-            unsafe { moq_endpoint_set_interrupted(ep, true) };
+        if let Some(ep) = self.ep.lock().unwrap().as_ref() {
+            ep.set_interrupted(true);
         }
         Ok(())
     }
 
     fn unlock_stop(&self) -> Result<(), gst::ErrorMessage> {
-        let ep = self.ep();
-        if !ep.is_null() {
-            unsafe { moq_endpoint_set_interrupted(ep, false) };
+        if let Some(ep) = self.ep.lock().unwrap().as_ref() {
+            ep.set_interrupted(false);
         }
         // A fragment queued behind an init segment before the flush is now
         // stale (its track/init state may no longer match); drop it instead

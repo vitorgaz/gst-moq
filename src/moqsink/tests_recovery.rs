@@ -14,8 +14,10 @@ use std::sync::{Mutex, MutexGuard};
 
 use super::imp::EOS_DRAIN_TIMEOUT_US;
 use super::{MoqSink, MoqSinkPad};
-use crate::moq::*;
 use crate::test_support::{serial, zero_sized, Addr};
+use moq5::sys::*;
+use moq5::testing::{install, Api, ApiGuard, REAL};
+use moq5::{MediaType, Packaging, RcBuf, SendObject, TrackConfig};
 
 const USEC_PER_SEC: i64 = 1_000_000;
 
@@ -175,7 +177,7 @@ unsafe extern "C" fn sender_attach(
     };
     let sender = &SENDER_ID as *const AtomicU8 as *mut moq_media_sender_t;
     if early {
-        assert!(active().imp().send_lock().sender.is_null());
+        assert!(active().imp().send_lock().sender.is_none());
         c.callbacks.on_ready.unwrap()(c.callbacks.ctx, sender);
     }
     *out = sender;
@@ -190,7 +192,8 @@ unsafe extern "C" fn sender_destroy(s: *mut moq_media_sender_t) {
         f.unwrap()(ctx.ptr(), s);
     }
 }
-unsafe extern "C" fn track_cfg_init(c: *mut moq_media_track_cfg_t) {
+unsafe extern "C" fn track_cfg_init(c: *mut moq_media_track_cfg_t, n: usize) {
+    assert_eq!(n, std::mem::size_of::<moq_media_track_cfg_t>());
     zero_sized(c, |c, n| c.struct_size = n);
 }
 unsafe extern "C" fn sender_add_track(
@@ -275,7 +278,7 @@ const API: Api = Api {
     moq_media_sender_callbacks_init_sized: sender_callbacks_init_sized,
     moq_media_sender_attach: sender_attach,
     moq_media_sender_destroy: sender_destroy,
-    moq_media_track_cfg_init: track_cfg_init,
+    moq_media_track_cfg_init_sized: track_cfg_init,
     moq_media_sender_add_track: sender_add_track,
     moq_media_sender_write: sender_write,
     moq_media_sender_end_track: sender_end_track,
@@ -292,15 +295,9 @@ fn now() -> i64 {
 }
 
 fn write_other(p: &MoqSinkPad) {
-    static BYTE: u8 = 42;
-    let payload = unsafe { rcbuf_wrap(&BYTE, 1, None, std::ptr::null_mut()) }.unwrap();
-    let o = moq_media_send_object_t {
-        struct_size: std::mem::size_of::<moq_media_send_object_t>() as u32,
-        payload,
-        ..Default::default()
-    };
+    let payload = RcBuf::copy_from_slice(&[42]).unwrap();
     assert_eq!(
-        active().imp().write_object(p, payload, &o, 1),
+        active().imp().write_object(p, SendObject::new(payload), 1),
         Ok(gst::FlowSuccess::Ok)
     );
 }
@@ -382,20 +379,22 @@ fn pad(s: &MoqSink, track: bool) -> MoqSinkPad {
         .downcast::<MoqSinkPad>()
         .unwrap();
     if track {
-        if s.imp().send_lock().sender.is_null() {
+        if s.imp().send_lock().sender.is_none() {
             let mut ts = s.imp().track_lock();
             ts.preparing_tracks = Some(Vec::new());
             assert!(s.imp().open_sender(&mut ts));
             ts.preparing_tracks = None;
         }
-        let sender = s.imp().send_lock().sender;
-        let mut c = moq_media_track_cfg_t::default();
-        let mut t = std::ptr::null_mut();
-        unsafe {
-            moq_media_track_cfg_init(&mut c);
-            assert_eq!(moq_media_sender_add_track(sender.get(), &c, &mut t), MOQ_OK);
-        }
-        p.set_track(Handle(t));
+        let cfg = TrackConfig::new("", MediaType::Audio, Packaging::Cmaf, "");
+        let t = s
+            .imp()
+            .send_lock()
+            .sender
+            .as_ref()
+            .unwrap()
+            .add_track(cfg)
+            .unwrap();
+        p.set_track(Some(t));
     }
     p
 }
@@ -606,7 +605,7 @@ fn restart() {
     let _ = s.set_state(gst::State::Ready);
     assert_eq!(mock().destroys, 1);
     let _ = s.set_state(gst::State::Paused);
-    assert!(p.track().is_null());
+    assert!(p.track().is_none());
     assert!(!p.eos());
     assert!(p.state().splitter.buf.is_empty());
     assert_eq!(mock().connects, 1); // reconnect is deferred until media
@@ -661,14 +660,15 @@ fn ready_callback(early: bool) {
             let m = mock();
             (m.ready_ctx, m.ready_fn)
         };
-        let sender = s.imp().send_lock().sender;
-        unsafe { f.unwrap()(ctx.ptr(), sender.get()) };
+        let sender = s.imp().send_lock().sender.as_ref().unwrap().as_ptr();
+        unsafe { f.unwrap()(ctx.ptr(), sender) };
         assert_eq!(mock().ready_logs, 1);
     }
     mock().ready_during_destroy = true; // Context must survive callback settlement.
     let _ = s.set_state(gst::State::Ready);
     assert_eq!(mock().ready_logs, 2);
-    assert!(s.imp().send_lock().ready_diagnostic.is_none());
+    // The callback context went with the sender, after its destroy.
+    assert!(s.imp().send_lock().sender.is_none());
     {
         let mut m = mock();
         m.ready_during_destroy = false;

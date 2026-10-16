@@ -1,21 +1,24 @@
 //! The sink pad: per-track state for moqsink.
 //!
 //! Locking. Flags other threads read to make barrier/EOS decisions (`eos`,
-//! `flushing`, `flush_pending`, `pend_ready`, `track`) are atomics; they are
-//! only WRITTEN while holding the element's object-state lock, which is what
-//! makes a multi-pad scan under that lock consistent. Everything else lives in
-//! `state`, which is only ever held briefly -- never across a clock wait, the
-//! track barrier, or another pad's lock.
+//! `flushing`, `flush_pending`, `pend_ready`) are atomics, and `track` sits
+//! behind its own leaf mutex; all of them are only WRITTEN while holding the
+//! element's object-state lock, which is what makes a multi-pad scan under
+//! that lock consistent. Everything else lives in `state`, which is only ever
+//! held briefly -- never across a clock wait, the track barrier, or another
+//! pad's lock.
 
 use gst::glib;
 use gst::prelude::*;
 use gst::subclass::prelude::*;
 
-use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{LazyLock, Mutex, MutexGuard, OnceLock};
 
+use moq5::cmaf::CmafInit;
+use moq5::{MediaTrack, MediaType, Packaging};
+
 use crate::fmp4::Splitter;
-use crate::moq::*;
 
 glib::wrapper! {
     pub struct MoqSinkPad(ObjectSubclass<imp::MoqSinkPad>) @extends gst::Pad, gst::Object;
@@ -24,29 +27,16 @@ glib::wrapper! {
 /// Fixed at request time.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PadKind {
-    pub media_type: moq_media_type_t,
-    pub packaging: moq_media_packaging_t,
+    pub media_type: MediaType,
+    pub packaging: Packaging,
 }
 
 impl PadKind {
     pub fn is_audio(&self) -> bool {
-        self.media_type == MOQ_MEDIA_TYPE_AUDIO
+        self.media_type == MediaType::Audio
     }
     pub fn is_cmaf(&self) -> bool {
-        self.packaging == MOQ_MEDIA_PACKAGING_CMAF
-    }
-}
-
-/// A parsed init segment's info. Its spans borrow from `PadState::init`.
-pub struct InitInfo(pub moq_cmaf_init_info_t);
-// SAFETY: the spans point into the pad's own `init` bytes, which move with it.
-unsafe impl Send for InitInfo {}
-
-impl Default for InitInfo {
-    fn default() -> Self {
-        let mut i = moq_cmaf_init_info_t::default();
-        unsafe { moq_cmaf_init_info_init(&mut i) };
-        InitInfo(i)
+        self.packaging == Packaging::Cmaf
     }
 }
 
@@ -91,11 +81,8 @@ pub struct PadState {
 
     /// CMAF (request pads)
     pub splitter: Splitter,
-    /// ftyp + moov as sent to the catalog
-    pub init: Option<Vec<u8>>,
-    /// borrows from `init`
-    pub init_info: InitInfo,
-    pub has_init_info: bool,
+    /// ftyp + moov as sent to the catalog, with its parsed first track
+    pub init: Option<CmafInit>,
     /// one-shot "skipping non-media boxes" log
     pub skip_logged: bool,
 }
@@ -121,8 +108,6 @@ impl PadState {
             pend_cp_ref_ids: None,
             splitter: Splitter::new(max_box),
             init: None,
-            init_info: InitInfo::default(),
-            has_init_info: false,
             skip_logged: false,
         }
     }
@@ -145,11 +130,11 @@ impl MoqSinkPad {
         self.imp().settings.lock().unwrap().bitrate
     }
 
-    pub fn track(&self) -> Handle<moq_media_track_t> {
-        Handle(self.imp().track.load(Ordering::SeqCst))
+    pub fn track(&self) -> Option<MediaTrack> {
+        *self.imp().track.lock().unwrap()
     }
-    pub fn set_track(&self, t: Handle<moq_media_track_t>) {
-        self.imp().track.store(t.get(), Ordering::SeqCst)
+    pub fn set_track(&self, t: Option<MediaTrack>) {
+        *self.imp().track.lock().unwrap() = t;
     }
 
     pub fn eos(&self) -> bool {
@@ -207,7 +192,7 @@ impl MoqSinkPad {
 
     /// Reset per-stream state (called for a fresh sender lifetime).
     pub fn reset(&self) {
-        self.set_track(Handle::null());
+        self.set_track(None);
         self.set_eos(false);
         self.set_flushing(false);
         self.set_flush_pending(false);
@@ -224,7 +209,6 @@ impl MoqSinkPad {
         let max_box = s.splitter.max_box();
         s.splitter = Splitter::new(max_box);
         s.init = None;
-        s.has_init_info = false;
         s.skip_logged = false;
         s.segment = gst::Segment::new();
     }
@@ -245,8 +229,8 @@ pub mod imp {
         pub(super) flushing: AtomicBool,
         pub(super) flush_pending: AtomicBool,
         pub(super) pend_ready: AtomicBool,
-        /// null until the track is added
-        pub(super) track: AtomicPtr<moq_media_track_t>,
+        /// None until the track is added
+        pub(super) track: Mutex<Option<MediaTrack>>,
         pub(super) objects_sent: AtomicU64,
         pub(super) clock_id: Mutex<Option<gst::SingleShotClockId>>,
         pub(super) state: Mutex<PadState>,
@@ -264,7 +248,7 @@ pub mod imp {
                 flushing: AtomicBool::new(false),
                 flush_pending: AtomicBool::new(false),
                 pend_ready: AtomicBool::new(false),
-                track: AtomicPtr::new(std::ptr::null_mut()),
+                track: Mutex::new(None),
                 objects_sent: AtomicU64::new(0),
                 clock_id: Mutex::new(None),
                 state: Mutex::new(PadState::new(16 << 20)),

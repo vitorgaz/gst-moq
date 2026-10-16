@@ -18,12 +18,11 @@ mod test_support;
 fn plugin_init(plugin: &gst::Plugin) -> Result<(), glib::BoolError> {
     // Touch a libmoq symbol so the link chain is exercised at load time and
     // surfaces in diagnostics.
-    let version = unsafe { std::ffi::CStr::from_ptr(moq::moq_version_string()) };
     gst::info!(
         gst::CAT_DEFAULT,
         obj = plugin,
         "gst-moq backed by libmoq {}",
-        version.to_string_lossy()
+        moq5::libmoq_version()
     );
 
     moqsink::register(plugin)?;

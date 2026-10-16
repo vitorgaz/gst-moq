@@ -23,21 +23,36 @@ service tier.
 The plugin is written in Rust on [gstreamer-rs](https://gitlab.freedesktop.org/gstreamer/gstreamer-rs).
 It requires Rust 1.92 or newer, the GStreamer 1.x development packages
 (`gstreamer-1.0`, `gstreamer-base-1.0`, 1.22 or newer), libclang (the
-`moq-sys` crate generates its libmoq bindings with bindgen), and an installed
+`moq5-sys` crate generates its libmoq bindings with bindgen), and an installed
 MOQ5 with the service component (`libmoq-service`).
 
-`moq-sys` links the static libmoq archives from `$MOQ_PREFIX/lib` and reads
-the headers from `$MOQ_PREFIX/include`; `MOQ_PREFIX` defaults to
-`../local-prefix` next to this repository. On Linux the plugin is a shared
-object, so every static library it links must be built position-independent
-(`-DCMAKE_POSITION_INDEPENDENT_CODE=ON`). If your libmoq build references
-further static libraries (picoquic, picotls, OpenSSL), name them in
-`MOQ_EXTRA_LIBS` (space-separated `cargo:rustc-link-lib` values, e.g.
+The plugin talks to libmoq through the `moq5` crate, a safe Rust API over
+libmoq's service tier, which sits on the raw `moq5-sys` bindings. Both live
+in the MOQ5 repository under `bindings/rust`; `Cargo.toml` pins the commit.
+That commit binds the libmoq API of upstream MOQ5 `main` (draft 22), so the
+installed MOQ5 must be built from a matching checkout.
+
+`moq5-sys` links the static libmoq archives from `$MOQ_PREFIX/lib` and reads
+the headers from `$MOQ_PREFIX/include`. `.cargo/config.toml` sets
+`MOQ_PREFIX` to `../local-prefix` next to this repository -- where MOQ5's
+`install` preset puts it -- unless the environment already sets it. On Linux
+the plugin is a shared object, so every static library it links must be
+built position-independent:
+
+```sh
+cd ../moq5
+cmake --preset install -DCMAKE_POSITION_INDEPENDENT_CODE=ON
+cmake --build build/install && cmake --install build/install
+```
+
+If your libmoq build references further static libraries (picoquic, picotls,
+OpenSSL), name them in `MOQ_EXTRA_LIBS` (space-separated
+`cargo:rustc-link-lib` values, e.g.
 `"static=picoquic-core static=picotls-core ssl crypto"`); they are searched in
 the same `lib` directory.
 
 ```sh
-cargo build --release                 # MOQ_PREFIX=<moq5-prefix> if not ../local-prefix
+cargo build --release                 # MOQ_PREFIX=<moq5-prefix> for another install
 export GST_PLUGIN_PATH="$PWD/target/release"
 gst-inspect-1.0 moqsink
 gst-inspect-1.0 moqsrc
@@ -49,12 +64,14 @@ gst-inspect-1.0 moqsrc
 cargo test
 ```
 
-runs, with no relay and no sockets:
+runs, with no relay and no sockets (the `moq5` crate's own tests run in the
+MOQ5 repository):
 
 - unit tests for the fMP4 splitter and the codec strings;
 - the element suites (`moqsink` track barrier and content protection,
   `moqsink` EOS/flush recovery, `moqsrc` delivery), which drive the real
-  element code with the libmoq service calls replaced by mocks;
+  element code with the libmoq service calls replaced by mocks (installed
+  through `moq5`'s `testing` feature);
 - `tests/smoke.sh` against a freshly built plugin (inspection, a CMAF publish
   pipeline against a refused relay, a `moqsink` state cycle), plus its
   socket-free guard tests in `tests/test_smoke_guards.py`.

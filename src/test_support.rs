@@ -31,11 +31,35 @@ impl Addr {
 }
 
 /// Copy a libmoq span out as a string (None for a null span).
-pub fn span_dup(b: crate::moq::moq_bytes_t) -> Option<String> {
+/// Borrow `s` as a libmoq byte span (null when empty), for fake objects.
+pub fn span(s: &[u8]) -> moq5::sys::moq_bytes_t {
+    if s.is_empty() {
+        moq5::sys::moq_bytes_t::default()
+    } else {
+        moq5::sys::moq_bytes_t {
+            data: s.as_ptr(),
+            len: s.len(),
+        }
+    }
+}
+
+/// View a libmoq byte span.
+///
+/// # Safety
+/// `b` must describe memory valid for `'a`.
+pub unsafe fn bytes<'a>(b: moq5::sys::moq_bytes_t) -> &'a [u8] {
+    if b.data.is_null() || b.len == 0 {
+        &[]
+    } else {
+        std::slice::from_raw_parts(b.data, b.len)
+    }
+}
+
+pub fn span_dup(b: moq5::sys::moq_bytes_t) -> Option<String> {
     if b.data.is_null() {
         None
     } else {
-        Some(String::from_utf8_lossy(unsafe { crate::moq::bytes(b) }).into_owned())
+        Some(String::from_utf8_lossy(unsafe { bytes(b) }).into_owned())
     }
 }
 

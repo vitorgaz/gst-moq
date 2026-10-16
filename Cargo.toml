@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "moq-sys"]
+members = ["."]
 resolver = "3"
 
 [package]
@@ -24,7 +24,12 @@ path = "src/bin/inspect_cmaf_fixture.rs"
 [dependencies]
 gst = { package = "gstreamer", version = "0.25", features = ["v1_22"] }
 gst-base = { package = "gstreamer-base", version = "0.25", features = ["v1_22"] }
-moq-sys = { path = "moq-sys" }
+# The Rust bindings live in moq5 (bindings/rust); pinned to a commit.
+moq5 = { git = "https://github.com/vitorgaz/moq5", rev = "b160ca1964acd68d637322d0f6ae6070ceb5f06f" }
+
+[dev-dependencies]
+# The fake-libmoq seam the unit tests install.
+moq5 = { git = "https://github.com/vitorgaz/moq5", rev = "b160ca1964acd68d637322d0f6ae6070ceb5f06f", features = ["testing"] }
 
 [profile.release]
 lto = "thin"

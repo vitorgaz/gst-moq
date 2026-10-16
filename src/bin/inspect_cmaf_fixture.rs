@@ -7,7 +7,7 @@
 use gst::glib;
 use gstmoq::codec::codec_string_from_init;
 use gstmoq::fmp4::{Kind, Splitter};
-use gstmoq::moq::*;
+use moq5::cmaf::{parse_fragment, CmafInit};
 
 fn sha256(data: &[u8]) -> String {
     glib::compute_checksum_for_data(glib::ChecksumType::Sha256, data)
@@ -20,17 +20,19 @@ fn run() -> i32 {
     if args.len() != 2 {
         return 2;
     }
-    let data = match std::fs::read(&args[1]) {
+    // GLib reads and reports exactly as the C tool did (g_printerr converts
+    // to the locale charset).
+    let data = match glib::file_get_contents(&args[1]) {
         Ok(d) => d,
         Err(e) => {
-            eprintln!("Failed to open file “{}”: {}", args[1], e);
+            glib::g_printerr!("{}\n", e.message());
             return 1;
         }
     };
     let mut splitter = Splitter::new(16 << 20);
     for chunk in data.chunks(7) {
         if let Err(e) = splitter.push(chunk) {
-            eprintln!("{e}");
+            glib::g_printerr!("{}\n", e);
             return 1;
         }
     }
@@ -40,43 +42,38 @@ fn run() -> i32 {
     }
 
     let mut fragments = 0u32;
-    let mut init: Option<Vec<u8>> = None;
-    let mut info = moq_cmaf_init_info_t::default();
-    unsafe { moq_cmaf_init_info_init(&mut info) };
+    let mut init: Option<CmafInit> = None;
     while let Some(unit) = splitter.pull() {
         let hash = sha256(&unit.data);
         match unit.kind {
             Kind::Init => {
-                // `info` borrows from the init bytes, so keep them alive in
-                // `init` before parsing.
-                let bytes = init.insert(unit.data);
-                if unsafe { moq_cmaf_parse_init(span(bytes), &mut info) } != MOQ_OK {
+                let size = unit.data.len();
+                let Ok(parsed) = CmafInit::parse(unit.data) else {
                     return 1;
-                }
-                let codec = codec_string_from_init(&info).unwrap_or_default();
+                };
+                let info = init.insert(parsed).info();
+                let codec = codec_string_from_init(info).unwrap_or_default();
                 println!(
                     "{{\"kind\":\"init\",\"size\":{},\"sha256\":\"{}\",\"timescale\":{},\"codec\":\"{}\"}}",
-                    bytes.len(),
+                    size,
                     hash,
-                    info.timescale,
+                    info.timescale(),
                     codec
                 );
             }
             Kind::Fragment => {
-                let mut samples = vec![moq_cmaf_sample_t::default(); 256];
-                let mut fragment = moq_cmaf_fragment_info_t::default();
-                let ok = init.is_some()
-                    && unsafe {
-                        moq_cmaf_fragment_info_init(
-                            &mut fragment,
-                            samples.as_mut_ptr(),
-                            samples.len(),
-                        );
-                        moq_cmaf_parse_fragment(span(&unit.data), &mut fragment)
-                    } == MOQ_OK
-                    && fragment.has_base_decode_time
-                    && fragment.track_id == info.track_id;
-                if !ok {
+                let Some(init) = init.as_ref() else {
+                    return 1;
+                };
+                // The C tool parsed into a fixed 256-sample table.
+                let fragment = match parse_fragment(&unit.data) {
+                    Ok(f) if f.samples.len() <= 256 => f,
+                    _ => return 1,
+                };
+                let Some(decode_ticks) = fragment.base_decode_time else {
+                    return 1;
+                };
+                if fragment.track_id != init.info().track_id() {
                     return 1;
                 }
                 println!(
@@ -84,8 +81,8 @@ fn run() -> i32 {
                     fragments,
                     unit.data.len(),
                     hash,
-                    fragment.base_decode_time,
-                    fragment.sample_count
+                    decode_ticks,
+                    fragment.samples.len()
                 );
                 fragments += 1;
             }

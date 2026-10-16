@@ -13,9 +13,9 @@
 //!
 //! The service tier owns the network thread, version negotiation, the sticky
 //! catalog and the bounded per-track send queues; chain functions only
-//! translate buffers into media objects. moq_media_sender_write() takes the
-//! payload rcbuf on MOQ_OK and its release callback (on the network thread)
-//! drops our buffer reference.
+//! translate buffers into media objects. MediaSender::write() takes the
+//! payload on success and libmoq drops our buffer reference when it releases
+//! it (on the network thread).
 //!
 //! Sync: with sync=true (default) each chain waits on the pipeline clock for
 //! the buffer's running time plus the configured latency, so non-live
@@ -51,16 +51,25 @@ use gst::glib;
 use gst::prelude::*;
 use gst::subclass::prelude::*;
 
-use std::ffi::c_void;
-use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Condvar, LazyLock, Mutex, MutexGuard, OnceLock};
 use std::time::Duration;
+
+use moq5::cmaf::{self, CmafInit, CodecKind};
+use moq5::sys::{
+    moq_result_t, MOQ_DONE, MOQ_ERR_CLOSED, MOQ_ERR_INTERRUPTED, MOQ_ERR_INVAL,
+    MOQ_ERR_WOULD_BLOCK, MOQ_ERR_WRONG_STATE, MOQ_OK,
+};
+use moq5::{
+    CmsfUrl, ContentProtection, DrmSystem, Endpoint, MediaSender, MediaTrack, MediaType, Namespace,
+    Packaging, RcBuf, SapType, SendObject, SenderConfig, StartupStatus, TrackConfig, Wait,
+};
 
 use super::pad::{MoqSinkPad, PadKind};
 use crate::clock;
 use crate::codec;
 use crate::fmp4;
-use crate::moq::*;
+use crate::moq::{endpoint_config, rc, relay_url};
 
 pub(crate) static CAT: LazyLock<gst::DebugCategory> = LazyLock::new(|| {
     gst::DebugCategory::new("moqsink", gst::DebugColorFlags::empty(), Some("MoQ sink"))
@@ -153,7 +162,7 @@ pub(crate) struct ObjState {
     pub(crate) state_flushing: bool,
     /// Endpoint publication and removal share this lock (and `send`); no
     /// callback can touch a freed endpoint.
-    pub(crate) ep: Handle<moq_endpoint_t>,
+    pub(crate) ep: Option<Endpoint>,
     pub(crate) eos_posted: bool,
 
     /// Wall-clock anchor for the LOC Capture Timestamp (LOC-01 2.3.1.1 is
@@ -177,7 +186,7 @@ impl Default for ObjState {
             latency: gst::ClockTime::ZERO,
             flush_count: 0,
             state_flushing: false,
-            ep: Handle::null(),
+            ep: None,
             eos_posted: false,
             loc_anchored: false,
             loc_anchor_epoch_us: 0,
@@ -189,21 +198,16 @@ impl Default for ObjState {
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct EndRequest {
-    track: Handle<moq_media_track_t>,
+    track: MediaTrack,
     deadline: i64,
     accepted: bool,
-}
-
-/// Immutable diagnostic snapshot, owned until sender callbacks are settled.
-pub(crate) struct ReadyDiagnostic {
-    namespace: String,
 }
 
 /// Everything serialized by the C element's send_lock.
 #[derive(Default)]
 pub(crate) struct SendState {
-    pub(crate) sender: Handle<moq_media_sender_t>,
-    pub(crate) ready_diagnostic: Option<Box<ReadyDiagnostic>>,
+    /// Holds the endpoint too; its on_ready context lives as long as it.
+    pub(crate) sender: Option<MediaSender>,
     pub(crate) eos_failed: bool,
     pub(crate) sender_generation: u64,
     /// sender-owned; survives pad release
@@ -233,76 +237,11 @@ pub(crate) struct CpEntry {
     robustness: Option<String>,
 }
 
-/// A track cfg snapshot whose spans point into buffers it owns, so it can
-/// wait for the sender startup task after the pad's own state moves on.
-pub(crate) struct PreparedTrack {
-    cfg: moq_media_track_cfg_t,
-    pad: MoqSinkPad,
-    _name: Vec<u8>,
-    _codec: Vec<u8>,
-    _channels: Vec<u8>,
-    _init: Vec<u8>,
-    /// contentProtectionRefIDs: the spans are copied because the caller's
-    /// array is a temporary, and the strings they point at because the pad
-    /// clears its ref ids on reset while this snapshot may still be queued.
-    _cp_ref_strs: Vec<Vec<u8>>,
-    _cp_refs: Vec<moq_bytes_t>,
-    track: Handle<moq_media_track_t>,
-}
-
-// SAFETY: the cfg's spans only point into buffers this struct owns.
-unsafe impl Send for PreparedTrack {}
-
-fn snapshot_span(span_in: moq_bytes_t, owned: &mut Vec<u8>) -> moq_bytes_t {
-    // SAFETY: the caller's cfg spans are valid for the duration of the call.
-    *owned = unsafe { bytes(span_in) }.to_vec();
-    span(owned)
-}
-
-impl PreparedTrack {
-    fn new(pad: &MoqSinkPad, cfg: &moq_media_track_cfg_t) -> Self {
-        let mut t = PreparedTrack {
-            cfg: *cfg,
-            pad: pad.clone(),
-            _name: Vec::new(),
-            _codec: Vec::new(),
-            _channels: Vec::new(),
-            _init: Vec::new(),
-            _cp_ref_strs: Vec::new(),
-            _cp_refs: Vec::new(),
-            track: Handle::null(),
-        };
-        t.cfg.name = snapshot_span(cfg.name, &mut t._name);
-        t.cfg.codec = snapshot_span(cfg.codec, &mut t._codec);
-        t.cfg.channel_config = snapshot_span(cfg.channel_config, &mut t._channels);
-        t.cfg.init_data = snapshot_span(cfg.init_data, &mut t._init);
-        if cfg.content_protection_ref_id_count > 0 {
-            // SAFETY: as for the other spans.
-            let refs = unsafe {
-                std::slice::from_raw_parts(
-                    cfg.content_protection_ref_ids,
-                    cfg.content_protection_ref_id_count,
-                )
-            };
-            t._cp_ref_strs = refs.iter().map(|r| unsafe { bytes(*r) }.to_vec()).collect();
-            t._cp_refs = t
-                ._cp_ref_strs
-                .iter()
-                .map(|s| moq_bytes_t {
-                    data: s.as_ptr(),
-                    len: s.len(),
-                })
-                .collect();
-            t.cfg.content_protection_ref_ids = t._cp_refs.as_ptr();
-        }
-        t
-    }
-}
-
 #[derive(Default)]
 pub(crate) struct TrackState {
-    /// app-thread snapshot, collected while committing
-    pub(crate) preparing_tracks: Option<Vec<PreparedTrack>>,
+    /// app-thread snapshot, collected while committing: each pad with the
+    /// track the startup task adds for it
+    pub(crate) preparing_tracks: Option<Vec<(MoqSinkPad, TrackConfig)>>,
     pub(crate) tracks_committed: bool,
     pub(crate) tracks_failed: bool,
     /// CMSF 4.1.1 root contentProtections authored for this session, built at
@@ -313,91 +252,6 @@ pub(crate) struct TrackState {
     pub(crate) cp_entries: Vec<CpEntry>,
 }
 
-#[derive(Default)]
-struct StartupFlags {
-    done: bool,
-    running: bool,
-    cancelled: bool,
-    result: moq_result_t,
-}
-
-/// The posted startup task. It lives on open_sender's stack; open_sender
-/// either sees it done or has moq_endpoint_stop() complete it (with a null
-/// session) before returning, so the endpoint never runs it after free.
-struct SenderStartup {
-    flags: Mutex<StartupFlags>,
-    cond: Condvar,
-    cfg: moq_media_sender_cfg_t,
-    sender: AtomicPtr<moq_media_sender_t>,
-    tracks: Mutex<Vec<PreparedTrack>>,
-}
-
-// SAFETY: the cfg is read-only once posted; its spans outlive the task.
-unsafe impl Sync for SenderStartup {}
-
-/// No element locks, waits, writes or teardown in this task. The endpoint
-/// runs posted tasks before sender hooks, so its first pump sees the whole
-/// set.
-unsafe extern "C" fn start_sender_task(
-    ep: *mut moq_endpoint_t,
-    session: *mut moq_session_t,
-    _now_us: u64,
-    ctx: *mut c_void,
-) -> moq_result_t {
-    let task = &*(ctx as *const SenderStartup);
-    let cancelled = {
-        let mut f = task.flags.lock().unwrap();
-        f.running = true;
-        f.cancelled || session.is_null()
-    };
-    let mut rc = if cancelled {
-        MOQ_ERR_INTERRUPTED
-    } else {
-        let mut sender = std::ptr::null_mut();
-        let rc = moq_media_sender_attach(ep, &task.cfg, &mut sender);
-        task.sender.store(sender, Ordering::SeqCst);
-        rc
-    };
-    {
-        let sender = task.sender.load(Ordering::SeqCst);
-        let mut tracks = task.tracks.lock().unwrap();
-        for t in tracks.iter_mut() {
-            if rc != MOQ_OK {
-                break;
-            }
-            rc = moq_media_sender_add_track(sender, &t.cfg, &mut t.track.0);
-        }
-    }
-    let mut f = task.flags.lock().unwrap();
-    f.result = rc;
-    f.done = true;
-    task.cond.notify_all();
-    rc
-}
-
-/// Network callback: no waiting, locks or dependency on the element.
-unsafe extern "C" fn on_ready(ctx: *mut c_void, _sender: *mut moq_media_sender_t) {
-    let diagnostic = &*(ctx as *const ReadyDiagnostic);
-    gst::info!(
-        CAT,
-        "native sender ready namespace={}",
-        diagnostic.namespace
-    );
-}
-
-/// rcbuf release callback for a mapped LOC buffer: runs on the service
-/// network thread and drops our buffer reference.
-unsafe extern "C" fn sink_frame_release(ctx: *mut c_void, _data: *const u8, _len: usize) {
-    drop(Box::from_raw(
-        ctx as *mut gst::MappedBuffer<gst::buffer::Readable>,
-    ));
-}
-
-/// Same for an owned CMAF fragment.
-unsafe extern "C" fn sink_bytes_release(ctx: *mut c_void, _data: *const u8, _len: usize) {
-    drop(Box::from_raw(ctx as *mut Vec<u8>));
-}
-
 // -- EOS helpers (callers serialize sender mutations and keep the endpoint
 // alive; no endpoint tasks are posted by them) --------------------------------
 
@@ -406,22 +260,17 @@ fn eos_remaining(deadline: i64) -> u64 {
     remaining.max(0) as u64
 }
 
-unsafe fn eos_end(
-    ep: *mut moq_endpoint_t,
-    sender: *mut moq_media_sender_t,
-    track: *mut moq_media_track_t,
-    deadline: i64,
-) -> moq_result_t {
+fn eos_end(ep: &Endpoint, sender: &MediaSender, track: MediaTrack, deadline: i64) -> moq_result_t {
     loop {
-        if moq_media_sender_is_fatal(sender) {
+        if sender.is_fatal() {
             return MOQ_ERR_CLOSED;
         }
         if eos_remaining(deadline) == 0 {
             return MOQ_DONE;
         }
-        let rc = moq_media_sender_end_track(sender, track);
-        if rc != MOQ_ERR_WOULD_BLOCK {
-            return rc;
+        let r = rc(&sender.end_track(track));
+        if r != MOQ_ERR_WOULD_BLOCK {
+            return r;
         }
         let remaining = eos_remaining(deadline);
         if remaining == 0 {
@@ -429,9 +278,8 @@ unsafe fn eos_end(
         }
         // Endpoint activity, rather than sender write readiness, avoids a
         // level-triggered spin when an end marker needs more queue capacity.
-        let rc = moq_endpoint_wait(ep, remaining.min(5000));
-        if rc != MOQ_OK && rc != MOQ_DONE {
-            return rc;
+        if let Err(e) = ep.wait(Duration::from_micros(remaining.min(5000))) {
+            return e.code();
         }
         if eos_remaining(deadline) == 0 {
             return MOQ_DONE;
@@ -439,10 +287,14 @@ unsafe fn eos_end(
     }
 }
 
-unsafe fn eos_drain(ep: *mut moq_endpoint_t, deadline: i64) -> moq_result_t {
+fn eos_drain(ep: &Endpoint, deadline: i64) -> moq_result_t {
     match eos_remaining(deadline) {
         0 => MOQ_DONE,
-        remaining => moq_endpoint_drain(ep, remaining),
+        remaining => match ep.drain(Duration::from_micros(remaining)) {
+            Ok(Wait::Ready) => MOQ_OK,
+            Ok(Wait::TimedOut) => MOQ_DONE,
+            Err(e) => e.code(),
+        },
     }
 }
 
@@ -650,21 +502,14 @@ impl MoqSink {
     // -- shared write path ---------------------------------------------------
 
     /// Submit one object and map the libmoq result onto a flow return. On any
-    /// non-OK result the payload is released here.
-    pub(crate) fn write_object(
-        &self,
-        pad: &MoqSinkPad,
-        payload: *mut moq_rcbuf_t,
-        o: &moq_media_send_object_t,
-        len: usize,
-    ) -> Flow {
+    /// failure the object (and so its payload) is released here.
+    pub(crate) fn write_object(&self, pad: &MoqSinkPad, obj: SendObject, len: usize) -> Flow {
+        let sync = obj.is_sync;
         let rc = {
             let send = self.send_lock();
-            if send.sender.is_null() {
-                drop(send);
-                unsafe { moq_rcbuf_decref(payload) };
+            let Some(sender) = send.sender.as_ref() else {
                 return Err(gst::FlowError::Flushing);
-            }
+            };
             let (flushing, ended) = {
                 let st = self.obj_lock();
                 (
@@ -673,40 +518,34 @@ impl MoqSink {
                 )
             };
             if flushing {
-                drop(send);
-                unsafe { moq_rcbuf_decref(payload) };
                 return Err(gst::FlowError::Flushing);
             }
             if ended {
-                drop(send);
-                unsafe { moq_rcbuf_decref(payload) };
                 return Err(gst::FlowError::Eos);
             }
-            unsafe { moq_media_sender_write(send.sender.get(), pad.track().get(), o) }
+            match pad.track() {
+                Some(track) => sender.write(track, obj).map_err(|e| e.error.code()),
+                None => Err(MOQ_ERR_INVAL),
+            }
         };
         match rc {
-            MOQ_OK => {
+            Ok(()) => {
                 pad.count_sent();
                 gst::log!(
                     CAT,
                     obj = pad,
                     "wrote {} object ({} B)",
-                    if o.is_sync { "sync" } else { "delta" },
+                    if sync { "sync" } else { "delta" },
                     len
                 );
                 Ok(gst::FlowSuccess::Ok)
             }
-            MOQ_ERR_WOULD_BLOCK => {
-                unsafe { moq_rcbuf_decref(payload) };
+            Err(MOQ_ERR_WOULD_BLOCK) => {
                 gst::log!(CAT, obj = pad, "dropped object under backpressure");
                 Ok(gst::FlowSuccess::Ok)
             }
-            MOQ_ERR_INTERRUPTED => {
-                unsafe { moq_rcbuf_decref(payload) };
-                Err(gst::FlowError::Flushing)
-            }
-            MOQ_ERR_CLOSED => {
-                unsafe { moq_rcbuf_decref(payload) };
+            Err(MOQ_ERR_INTERRUPTED) => Err(gst::FlowError::Flushing),
+            Err(MOQ_ERR_CLOSED) => {
                 gst::element_imp_error!(
                     self,
                     gst::ResourceError::Write,
@@ -714,8 +553,7 @@ impl MoqSink {
                 );
                 Err(gst::FlowError::Error)
             }
-            MOQ_ERR_INVAL => {
-                unsafe { moq_rcbuf_decref(payload) };
+            Err(MOQ_ERR_INVAL) => {
                 gst::element_imp_error!(
                     self,
                     gst::ResourceError::Write,
@@ -723,13 +561,12 @@ impl MoqSink {
                         "libmoq rejected object {} on track \"{}\" (rc={}: invalid object, e.g. CMAF validation failed or a group start that is not a SAP)",
                         pad.objects_sent(),
                         pad.track_name(),
-                        rc
+                        MOQ_ERR_INVAL
                     )
                 );
                 Err(gst::FlowError::Error)
             }
-            _ => {
-                unsafe { moq_rcbuf_decref(payload) };
+            Err(rc) => {
                 gst::element_imp_error!(
                     self,
                     gst::ResourceError::Write,
@@ -827,13 +664,8 @@ impl MoqSink {
                     id.unschedule();
                 }
             }
-            if !st.ep.is_null() {
-                unsafe {
-                    moq_endpoint_set_interrupted(
-                        st.ep.get(),
-                        st.state_flushing || st.flush_count > 0,
-                    )
-                };
+            if let Some(ep) = &st.ep {
+                ep.set_interrupted(st.state_flushing || st.flush_count > 0);
             }
         }
         self.notify_tracks();
@@ -875,34 +707,30 @@ impl MoqSink {
         ok
     }
 
+    /// Defer the track to the sender startup task while committing, or add
+    /// it to the running sender.
     fn register_track(
         &self,
         ts: &mut TrackState,
         pad: &MoqSinkPad,
-        cfg: &moq_media_track_cfg_t,
+        cfg: TrackConfig,
     ) -> moq_result_t {
         if let Some(prep) = ts.preparing_tracks.as_mut() {
-            prep.push(PreparedTrack::new(pad, cfg));
+            prep.push((pad.clone(), cfg));
             return MOQ_OK;
         }
         let send = self.send_lock();
         let st = self.obj_lock();
-        if send.sender.is_null() {
-            MOQ_ERR_CLOSED
-        } else if pad.eos() || pad.flushing() || st.eos_posted {
-            MOQ_ERR_WRONG_STATE
-        } else {
-            let mut track = std::ptr::null_mut();
-            let rc = unsafe { moq_media_sender_add_track(send.sender.get(), cfg, &mut track) };
-            pad.set_track(Handle(track));
-            rc
+        match send.sender.as_ref() {
+            None => MOQ_ERR_CLOSED,
+            Some(_) if pad.eos() || pad.flushing() || st.eos_posted => MOQ_ERR_WRONG_STATE,
+            Some(sender) => {
+                let track = sender.add_track(cfg);
+                let r = rc(&track);
+                pad.set_track(track.ok());
+                r
+            }
         }
-    }
-
-    fn track_cfg() -> moq_media_track_cfg_t {
-        let mut tc = moq_media_track_cfg_t::default();
-        unsafe { moq_media_track_cfg_init(&mut tc) };
-        tc
     }
 
     /// Add the prepared LOC audio track. Caller holds the track lock.
@@ -915,22 +743,17 @@ impl MoqSink {
             let codec = s.pend_codec.clone().unwrap_or_default();
             let chan_cfg = s.pend_chan.clone().unwrap_or_default();
 
-            let mut tc = Self::track_cfg();
-            tc.name = span(track_name.as_bytes());
-            tc.media_type = MOQ_MEDIA_TYPE_AUDIO;
-            tc.packaging = MOQ_MEDIA_PACKAGING_RAW;
-            tc.codec = span(codec.as_bytes());
-            tc.is_live = true;
-            tc.bitrate = bitrate;
-            tc.samplerate = s.rate as u32;
-            tc.channel_config = span(chan_cfg.as_bytes());
             // The ASC is this track's decoder config, so it belongs in
             // initData for the same reason avcC does on the video pad: a
             // subscriber cannot configure a decoder from the access units
             // alone.
-            tc.init_data = span(asc);
+            let tc = TrackConfig::new(&track_name, MediaType::Audio, Packaging::Loc, &codec)
+                .bitrate(bitrate)
+                .samplerate(s.rate as u32)
+                .channel_config(chan_cfg)
+                .init_data(asc);
             (
-                self.register_track(ts, pad, &tc),
+                self.register_track(ts, pad, tc),
                 codec,
                 s.rate,
                 s.channels,
@@ -1019,26 +842,20 @@ impl MoqSink {
             let s = pad.state();
             let codec = s.pend_codec.clone().unwrap_or_default();
 
-            let mut tc = Self::track_cfg();
-            tc.name = span(track_name.as_bytes());
-            tc.media_type = MOQ_MEDIA_TYPE_VIDEO;
-            tc.packaging = MOQ_MEDIA_PACKAGING_RAW;
-            tc.codec = span(codec.as_bytes());
-            tc.is_live = true;
-            tc.bitrate = bitrate;
-            if let Some(avcc) = s.pend_avcc.as_deref() {
-                tc.init_data = span(avcc);
+            let mut tc = TrackConfig::new(&track_name, MediaType::Video, Packaging::Loc, &codec)
+                .bitrate(bitrate);
+            let init_len = s.pend_avcc.as_ref().map_or(0, |a| a.len());
+            if let Some(avcc) = s.pend_avcc.clone() {
+                tc = tc.init_data(avcc);
             }
             if s.width > 0 && s.height > 0 {
-                tc.width = s.width as u32;
-                tc.height = s.height as u32;
+                tc = tc.dimensions(s.width as u32, s.height as u32);
             }
             if s.fps_n > 0 && s.fps_d > 0 {
-                tc.framerate_millis = (1000u64 * s.fps_n as u64) / s.fps_d as u64;
+                tc = tc.framerate_millis((1000u64 * s.fps_n as u64) / s.fps_d as u64);
             }
-            let init_len = tc.init_data.len;
             (
-                self.register_track(ts, pad, &tc),
+                self.register_track(ts, pad, tc),
                 codec,
                 s.width,
                 s.height,
@@ -1120,7 +937,7 @@ impl MoqSink {
             if failed {
                 break;
             }
-            if !p.pend_ready() || !p.track().is_null() || self.pad_cancelled(p) {
+            if !p.pend_ready() || p.track().is_some() || self.pad_cancelled(p) {
                 continue;
             }
             let kind = p.kind();
@@ -1198,7 +1015,7 @@ impl MoqSink {
             }
         }
         if ts.tracks_committed
-            && pad.track().is_null()
+            && pad.track().is_none()
             && pad.pend_ready()
             && !self.pad_cancelled(pad)
         {
@@ -1210,7 +1027,7 @@ impl MoqSink {
             );
         }
 
-        ts.tracks_committed && !pad.track().is_null()
+        ts.tracks_committed && pad.track().is_some()
     }
 
     fn chain_loc(&self, pad: &MoqSinkPad, buffer: gst::Buffer) -> Flow {
@@ -1230,7 +1047,7 @@ impl MoqSink {
             return Err(gst::FlowError::Error);
         };
 
-        if pad.track().is_null() {
+        if pad.track().is_none() {
             if !keyframe {
                 gst::log!(
                     CAT,
@@ -1257,16 +1074,10 @@ impl MoqSink {
             }
         }
 
-        let (fatal, fatal_code) = {
-            let send = self.send_lock();
-            let fatal =
-                send.sender.is_null() || unsafe { moq_media_sender_is_fatal(send.sender.get()) };
-            let code = if !send.sender.is_null() && fatal {
-                unsafe { moq_media_sender_fatal_code(send.sender.get()) }
-            } else {
-                0
-            };
-            (fatal, code)
+        let (fatal, fatal_code) = match self.send_lock().sender.as_ref() {
+            None => (true, 0),
+            Some(sender) if sender.is_fatal() => (true, sender.fatal_code()),
+            Some(_) => (false, 0),
         };
         if fatal {
             gst::element_imp_error!(
@@ -1300,13 +1111,13 @@ impl MoqSink {
         } else {
             loc_skip_leading_aud(frame.as_slice())
         };
-        let data = unsafe { frame.as_ptr().add(skip) };
         let len = frame.len() - skip;
-        let ctx = Box::into_raw(Box::new(frame)) as *mut c_void;
-        let payload = match unsafe { rcbuf_wrap(data, len, Some(sink_frame_release), ctx) } {
+        // Zero-copy: libmoq drops the mapped buffer when it releases the
+        // payload.
+        let end = frame.len();
+        let payload = match RcBuf::from_owner_range(frame, skip..end) {
             Ok(p) => p,
             Err(_) => {
-                unsafe { sink_frame_release(ctx, data, len) };
                 gst::element_imp_error!(self, gst::ResourceError::Write, ("rcbuf wrap failed"));
                 return Err(gst::FlowError::Error);
             }
@@ -1385,19 +1196,16 @@ impl MoqSink {
             self.obj_lock().loc_video_group_pts = pts;
         }
 
-        let o = moq_media_send_object_t {
-            struct_size: std::mem::size_of::<moq_media_send_object_t>() as u32,
-            payload,
+        let o = SendObject {
             is_sync: keyframe,
             starts_group,
             decode_time_us: dts_us,
             presentation_time_us: pts_us,
-            has_capture_time: have_capture,
-            capture_time_us: capture_us,
-            ..Default::default()
+            capture_time_us: have_capture.then_some(capture_us),
+            ..SendObject::new(payload)
         };
 
-        self.write_object(pad, payload, &o, len)
+        self.write_object(pad, o, len)
     }
 
     // -- CMAF path (request pads) --------------------------------------------
@@ -1410,43 +1218,37 @@ impl MoqSink {
     /// the sender cfg.
     fn prepare_cmaf_track(&self, pad: &MoqSinkPad, init: Vec<u8>) -> bool {
         let kind = pad.kind();
-        let mut s = pad.state();
-        s.init = Some(init);
-        let mut info = super::pad::InitInfo::default();
-        let rc = unsafe { moq_cmaf_parse_init(span(s.init.as_deref().unwrap()), &mut info.0) };
-        s.init_info = info;
-        if rc != MOQ_OK {
-            drop(s);
-            gst::element_imp_error!(
-                self,
-                gst::StreamError::Format,
-                (
-                    "could not parse CMAF init segment on pad {} (rc={})",
-                    pad.name(),
-                    rc
-                )
-            );
-            return false;
-        }
-        s.has_init_info = true;
+        let init = match CmafInit::parse(init) {
+            Ok(init) => init,
+            Err(e) => {
+                gst::element_imp_error!(
+                    self,
+                    gst::StreamError::Format,
+                    (
+                        "could not parse CMAF init segment on pad {} (rc={})",
+                        pad.name(),
+                        e.code()
+                    )
+                );
+                return false;
+            }
+        };
 
-        let codec_kind = s.init_info.0.codec_kind;
-        let Some(codec) = codec::codec_string_from_init(&s.init_info.0) else {
-            drop(s);
+        let codec_kind = init.info().codec_kind();
+        let Some(codec) = codec::codec_string_from_init(init.info()) else {
             gst::element_imp_error!(
                 self,
                 gst::StreamError::CodecNotFound,
                 (
                     "unsupported codec in CMAF init segment on pad {} (libmoq kind {}); this plugin publishes avc1, mp4a and opus",
                     pad.name(),
-                    codec_kind
+                    codec_kind.code()
                 )
             );
             return false;
         };
-        let audio_codec = codec_kind == MOQ_CMAF_CODEC_AAC || codec_kind == MOQ_CMAF_CODEC_OPUS;
+        let audio_codec = matches!(codec_kind, CodecKind::Aac | CodecKind::Opus);
         if kind.is_audio() != audio_codec {
-            drop(s);
             gst::element_imp_error!(
                 self,
                 gst::StreamError::WrongType,
@@ -1460,6 +1262,8 @@ impl MoqSink {
             return false;
         }
 
+        let mut s = pad.state();
+        s.init = Some(init);
         s.pend_codec = Some(codec);
         true
     }
@@ -1472,9 +1276,7 @@ impl MoqSink {
         let sap_timeline = self.settings.lock().unwrap().sap_timeline;
         let s = pad.state();
 
-        let (Some(codec), true, Some(init)) =
-            (s.pend_codec.clone(), s.has_init_info, s.init.as_deref())
-        else {
+        let (Some(codec), Some(init)) = (s.pend_codec.clone(), s.init.as_ref()) else {
             drop(s);
             gst::element_imp_error!(
                 self,
@@ -1486,61 +1288,49 @@ impl MoqSink {
             );
             return Err(gst::FlowError::Error);
         };
-        let info = &s.init_info.0;
+        let info = init.info();
 
-        let channels = if info.channel_count > 0 {
-            format!("{}", info.channel_count)
+        let channels = if info.channel_count() > 0 {
+            format!("{}", info.channel_count())
         } else {
             "2".to_string()
         };
 
-        let mut tc = Self::track_cfg();
-        tc.name = span(track_name.as_bytes());
-        tc.media_type = kind.media_type;
-        tc.packaging = MOQ_MEDIA_PACKAGING_CMAF;
-        tc.codec = span(codec.as_bytes());
-        tc.is_live = true;
-        tc.bitrate = bitrate;
-        tc.timescale = info.timescale;
-        tc.init_data = span(init);
-        tc.emit_sap_timeline = sap_timeline;
+        let mut tc = TrackConfig::new(&track_name, kind.media_type, Packaging::Cmaf, &codec)
+            .bitrate(bitrate)
+            .timescale(info.timescale())
+            .init_data(init.data());
+        if sap_timeline {
+            tc = tc.sap_timeline(0);
+        }
         // CMSF 4.1.2: declaring these ids tells a subscriber the track is
         // encrypted, and libmoq cross-checks that every id resolves to a root
         // entry AND that init_data really carries the 4.2 CENC boxes.
         // Resolved at the barrier, so an unprotected track leaves this empty.
-        let refs: Vec<moq_bytes_t> = s
-            .pend_cp_ref_ids
-            .iter()
-            .flatten()
-            .map(|r| span(r.as_bytes()))
-            .collect();
-        if !refs.is_empty() {
-            tc.content_protection_ref_ids = refs.as_ptr();
-            tc.content_protection_ref_id_count = refs.len();
+        let refs = s.pend_cp_ref_ids.clone().unwrap_or_default();
+        let n_refs = refs.len();
+        if n_refs > 0 {
+            tc = tc.content_protection_ref_ids(refs);
         }
-        if kind.media_type == MOQ_MEDIA_TYPE_VIDEO {
-            tc.width = info.width;
-            tc.height = info.height;
+        if kind.media_type == MediaType::Video {
+            tc = tc.dimensions(info.width(), info.height());
             if s.fps_n > 0 && s.fps_d > 0 {
-                tc.framerate_millis = (1000u64 * s.fps_n as u64) / s.fps_d as u64;
+                tc = tc.framerate_millis((1000u64 * s.fps_n as u64) / s.fps_d as u64);
             }
         } else {
-            tc.samplerate = info.samplerate;
-            tc.channel_config = span(channels.as_bytes());
+            tc = tc.samplerate(info.samplerate()).channel_config(&channels);
         }
 
         // register_track either adds the track now or defers the cfg to the
-        // sender startup task; it snapshots every span it keeps, refs
-        // included, so the array is ours to drop either way.
-        let rc = self.register_track(ts, pad, &tc);
+        // sender startup task, which owns everything the cfg points at.
+        let rc = self.register_track(ts, pad, tc);
         let (width, height, samplerate, timescale, init_len) = (
-            info.width,
-            info.height,
-            info.samplerate,
-            info.timescale,
-            init.len(),
+            info.width(),
+            info.height(),
+            info.samplerate(),
+            info.timescale(),
+            init.data().len(),
         );
-        let n_refs = refs.len();
         drop(s);
         if rc != MOQ_OK {
             gst::element_imp_error!(
@@ -1558,7 +1348,7 @@ impl MoqSink {
                     }
                 )
             );
-        } else if kind.media_type == MOQ_MEDIA_TYPE_VIDEO {
+        } else if kind.media_type == MediaType::Video {
             gst::debug!(
                 CAT,
                 obj = pad,
@@ -1592,86 +1382,58 @@ impl MoqSink {
 
     /// Send one moof+mdat fragment as a MoQ object.
     fn send_fragment(&self, pad: &MoqSinkPad, frag: Vec<u8>) -> Flow {
-        // First sample flags decide whether this fragment opens a group.
-        // Start with a small table; if the fragment holds more samples than
-        // that, MOQ_ERR_BUFFER reports the required count (trusted,
-        // fragment-bounded) without filling any sample, so grow and reparse
-        // once. Only MOQ_OK means the sample table (and samples[0].flags) is
-        // actually populated.
-        let mut samples = vec![moq_cmaf_sample_t::default(); 64];
-        let mut fi = moq_cmaf_fragment_info_t::default();
-        let mut rc = unsafe {
-            moq_cmaf_fragment_info_init(&mut fi, samples.as_mut_ptr(), samples.len());
-            moq_cmaf_parse_fragment(span(&frag), &mut fi)
+        // First sample flags decide whether this fragment opens a group. The
+        // sample table is sized to the fragment (parse_fragment grows it once
+        // when libmoq reports more samples than fit).
+        let first_flags = match cmaf::parse_fragment(&frag) {
+            Ok(fi) => fi.first_sample_flags(),
+            Err(e) => {
+                gst::element_imp_error!(
+                    self,
+                    gst::StreamError::Format,
+                    (
+                        "malformed CMAF fragment on pad {} (rc={})",
+                        pad.name(),
+                        e.code()
+                    )
+                );
+                return Err(gst::FlowError::Error);
+            }
         };
-        if rc == MOQ_ERR_BUFFER {
-            samples = vec![moq_cmaf_sample_t::default(); fi.sample_count];
-            rc = unsafe {
-                moq_cmaf_fragment_info_init(&mut fi, samples.as_mut_ptr(), samples.len());
-                moq_cmaf_parse_fragment(span(&frag), &mut fi)
-            };
-        }
-        if rc != MOQ_OK {
-            gst::element_imp_error!(
-                self,
-                gst::StreamError::Format,
-                ("malformed CMAF fragment on pad {} (rc={})", pad.name(), rc)
-            );
-            return Err(gst::FlowError::Error);
-        }
         // sample_is_non_sync_sample (bit 0x00010000): clear means this sample
         // IS a sync sample. Audio fragments are always treated as sync points.
-        // Do not use moq_cmaf_sap_from_sample_flags() here: it also reports
+        // Do not use cmaf::sap_from_sample_flags() here: it also reports
         // UNKNOWN (possible open-GOP SAP-3) for a non-sync-but-independent
         // sample, which is not what "opens a group" means for mp4mux's trun
         // first_sample_flags.
-        let first_flags = if fi.sample_count > 0 {
-            samples[0].flags
-        } else {
-            fi.default_sample_flags
-        };
         let sync = pad.kind().is_audio() || first_flags & 0x0001_0000 == 0;
 
         let len = frag.len();
-        let data = frag.as_ptr();
-        let ctx = Box::into_raw(Box::new(frag)) as *mut c_void;
-        let payload = match unsafe { rcbuf_wrap(data, len, Some(sink_bytes_release), ctx) } {
+        // Zero-copy: libmoq drops the fragment when it releases the payload.
+        let payload = match RcBuf::from_owner(frag) {
             Ok(p) => p,
             Err(_) => {
-                unsafe { sink_bytes_release(ctx, data, len) };
                 gst::element_imp_error!(self, gst::ResourceError::Write, ("rcbuf wrap failed"));
                 return Err(gst::FlowError::Error);
             }
         };
 
-        let mut o = moq_media_send_object_t {
-            struct_size: std::mem::size_of::<moq_media_send_object_t>() as u32,
-            payload,
-            properties: std::ptr::null_mut(), // CMAF timing lives in the fragment
+        // CMAF timing lives in the fragment, so no properties.
+        let o = SendObject {
             is_sync: sync,
             starts_group: sync,
-            ..Default::default()
+            sap_type: sync.then_some(SapType::Type1),
+            ..SendObject::new(payload)
         };
-        if sync {
-            o.has_sap_type = true;
-            o.sap_type = MOQ_SAP_TYPE_1;
-        }
-        self.write_object(pad, payload, &o, len)
+        self.write_object(pad, o, len)
     }
 
     fn chain_cmaf(&self, pad: &MoqSinkPad, buffer: gst::Buffer) -> Flow {
         // The sender is attached by the track barrier below, not by start, so
         // a null sender here just means no pad has produced a track yet.
-        let (fatal, fatal_code) = {
-            let send = self.send_lock();
-            let fatal =
-                !send.sender.is_null() && unsafe { moq_media_sender_is_fatal(send.sender.get()) };
-            let code = if fatal {
-                unsafe { moq_media_sender_fatal_code(send.sender.get()) }
-            } else {
-                0
-            };
-            (fatal, code)
+        let (fatal, fatal_code) = match self.send_lock().sender.as_ref() {
+            Some(sender) if sender.is_fatal() => (true, sender.fatal_code()),
+            _ => (false, 0),
         };
         if fatal {
             gst::element_imp_error!(
@@ -1709,7 +1471,7 @@ impl MoqSink {
             };
             match u.kind {
                 fmp4::Kind::Init => {
-                    if !pad.track().is_null() {
+                    if pad.track().is_some() {
                         // A new init segment mid-stream is a codec change; not
                         // supported.
                         gst::element_imp_error!(
@@ -1739,7 +1501,7 @@ impl MoqSink {
                     }
                 }
                 fmp4::Kind::Fragment => {
-                    if pad.track().is_null() {
+                    if pad.track().is_none() {
                         gst::element_imp_error!(
                             self,
                             gst::StreamError::Format,
@@ -1780,20 +1542,16 @@ impl MoqSink {
     /// Keep accepted/deferred native obligations independently of Gst pads.
     /// Release serialization between retries so another track can keep
     /// writing.
-    fn end_handle(
-        &self,
-        track: Handle<moq_media_track_t>,
-        deadline: i64,
-        generation: u64,
-    ) -> moq_result_t {
+    fn end_handle(&self, track: MediaTrack, deadline: i64, generation: u64) -> moq_result_t {
         loop {
             let (rc, remaining) = {
-                let mut send = self.send_lock();
-                let ep = self.obj_lock().ep;
-                if send.sender.is_null() || ep.is_null() || send.sender_generation != generation {
-                    return MOQ_ERR_CLOSED;
-                }
-                let sender = send.sender;
+                let mut guard = self.send_lock();
+                let send = &mut *guard;
+                let has_ep = self.obj_lock().ep.is_some();
+                let sender = match send.sender.as_ref() {
+                    Some(sender) if has_ep && send.sender_generation == generation => sender,
+                    _ => return MOQ_ERR_CLOSED,
+                };
                 let idx = match send.end_requests.iter().position(|r| r.track == track) {
                     Some(i) => i,
                     None => {
@@ -1809,12 +1567,12 @@ impl MoqSink {
                 let remaining = eos_remaining(request.deadline);
                 let rc = if request.accepted {
                     MOQ_OK
-                } else if unsafe { moq_media_sender_is_fatal(sender.get()) } {
+                } else if sender.is_fatal() {
                     MOQ_ERR_CLOSED
                 } else if remaining == 0 {
                     MOQ_DONE
                 } else {
-                    unsafe { moq_media_sender_end_track(sender.get(), track.get()) }
+                    rc(&sender.end_track(track))
                 };
                 if rc == MOQ_OK {
                     request.accepted = true;
@@ -1834,10 +1592,9 @@ impl MoqSink {
             let _st = self.obj_lock();
             (pad.track(), send.sender_generation)
         };
-        if track.is_null() {
-            MOQ_OK
-        } else {
-            self.end_handle(track, deadline, generation)
+        match track {
+            None => MOQ_OK,
+            Some(track) => self.end_handle(track, deadline, generation),
         }
     }
 
@@ -1879,35 +1636,30 @@ impl MoqSink {
     /// here.
     fn drain(&self, deadline: i64) -> bool {
         let rc = {
-            let mut send = self.send_lock();
-            let ep = self.obj_lock().ep;
-            let sender = send.sender;
-            let mut rc = if !send.eos_failed
-                && ((!sender.is_null() && !ep.is_null())
-                    || (sender.is_null() && ep.is_null() && send.end_requests.is_empty()))
-            {
-                MOQ_OK
-            } else {
-                MOQ_ERR_CLOSED
+            let mut guard = self.send_lock();
+            let send = &mut *guard;
+            let ep = self.obj_lock().ep.clone();
+            let mut rc = match (send.sender.as_ref(), ep.as_ref()) {
+                _ if send.eos_failed => MOQ_ERR_CLOSED,
+                (Some(_), Some(_)) => MOQ_OK,
+                (None, None) if send.end_requests.is_empty() => MOQ_OK,
+                _ => MOQ_ERR_CLOSED,
             };
-            for r in send.end_requests.iter_mut() {
-                if rc != MOQ_OK {
-                    break;
-                }
-                if !r.accepted {
-                    rc = unsafe {
-                        eos_end(
-                            ep.get(),
-                            sender.get(),
-                            r.track.get(),
-                            r.deadline.min(deadline),
-                        )
-                    };
-                    r.accepted = rc == MOQ_OK;
+            if let (Some(sender), Some(ep)) = (send.sender.as_ref(), ep.as_ref()) {
+                for r in send.end_requests.iter_mut() {
+                    if rc != MOQ_OK {
+                        break;
+                    }
+                    if !r.accepted {
+                        rc = eos_end(ep, sender, r.track, r.deadline.min(deadline));
+                        r.accepted = rc == MOQ_OK;
+                    }
                 }
             }
-            if rc == MOQ_OK && !ep.is_null() {
-                rc = unsafe { eos_drain(ep.get(), deadline) };
+            if rc == MOQ_OK {
+                if let Some(ep) = ep.as_ref() {
+                    rc = eos_drain(ep, deadline);
+                }
             }
             rc
         };
@@ -1940,20 +1692,21 @@ impl MoqSink {
         let (mut all, mut any_linked) = (true, false);
         for p in &pads {
             let track = p.track();
-            if !p.is_linked() && track.is_null() {
+            if !p.is_linked() && track.is_none() {
                 continue;
             }
             any_linked = true;
             if !p.eos() {
                 all = false;
             }
-            if !track.is_null()
-                && !send
+            if let Some(track) = track {
+                if !send
                     .end_requests
                     .iter()
                     .any(|r| r.track == track && r.accepted)
-            {
-                all = false;
+                {
+                    all = false;
+                }
             }
         }
         if all && any_linked {
@@ -1987,9 +1740,7 @@ impl MoqSink {
                     .unwrap_or((0, 0));
                 s.fps_n = n;
                 s.fps_d = d;
-                if kind.media_type == MOQ_MEDIA_TYPE_VIDEO
-                    && kind.packaging == MOQ_MEDIA_PACKAGING_RAW
-                {
+                if kind.media_type == MediaType::Video && kind.packaging == Packaging::Loc {
                     s.avc = st.get::<&str>("stream-format").ok() == Some("avc");
                     s.codec_data = if s.avc {
                         buffer_field("codec_data")
@@ -1997,7 +1748,7 @@ impl MoqSink {
                         None
                     };
                 }
-                if kind.is_audio() && kind.packaging == MOQ_MEDIA_PACKAGING_RAW {
+                if kind.is_audio() && kind.packaging == Packaging::Loc {
                     s.rate = int("rate");
                     s.channels = int("channels");
                     s.codec_data = buffer_field("codec_data");
@@ -2164,7 +1915,7 @@ impl MoqSink {
     /// and record on each pad the refIDs its track must reference.
     ///
     /// The scheme and the KID come from the init segment the pad is already
-    /// forwarding -- moq_cmaf_parse_init fills has_cenc/scheme/default_kid,
+    /// forwarding -- parsing it yields the CENC scheme and default_KID,
     /// so nothing about the encryption itself has to be configured here.
     /// drm-systems supplies only what an fMP4 cannot carry: which DRM systems
     /// the stream is offered under, and their licence URLs and PSSH.
@@ -2206,23 +1957,30 @@ impl MoqSink {
             let mut s = p.state();
             s.pend_cp_ref_ids = None;
 
-            if !p.pend_ready() || !p.kind().is_cmaf() || !s.has_init_info || !s.init_info.0.has_cenc
-            {
+            let cenc = if p.pend_ready() && p.kind().is_cmaf() {
+                s.init.as_ref().and_then(|i| i.info().cenc()).map(|c| {
+                    (
+                        c.default_kid.to_vec(),
+                        String::from_utf8_lossy(c.scheme).into_owned(),
+                    )
+                })
+            } else {
+                None
+            };
+            let Some((default_kid, scheme)) = cenc else {
                 continue;
-            }
+            };
             protected_pads += 1;
 
-            let info = &s.init_info.0;
-            let Some(kid) = kid_to_uuid(unsafe { bytes(info.default_kid) }) else {
+            let Some(kid) = kid_to_uuid(&default_kid) else {
                 gst::warning!(
                     CAT,
                     obj = p,
                     "encrypted CMAF track with no usable tenc default_KID ({} bytes); publishing it without contentProtections",
-                    info.default_kid.len
+                    default_kid.len()
                 );
                 continue;
             };
-            let scheme = String::from_utf8_lossy(unsafe { bytes(info.scheme) }).into_owned();
 
             if systems.is_empty() {
                 gst::warning!(
@@ -2279,216 +2037,151 @@ impl MoqSink {
     /// change. Caller holds the track lock.
     pub(crate) fn open_sender(&self, ts: &mut TrackState) -> bool {
         let s = self.settings();
-        let ns_guard = self.namespace.lock().unwrap();
-        let Some(ns) = ns_guard.as_ref() else {
+        let Some(ns) = self.namespace.lock().unwrap().clone() else {
             return false;
         };
 
         let url = relay_url(&s.host, s.port, &s.relay_path);
-        let pinned: moq_version_t = s.draft as moq_version_t;
-        let mut ep = std::ptr::null_mut();
-        let rc = unsafe {
-            let ec = endpoint_cfg(&url, s.insecure, s.draft, &pinned);
-            moq_endpoint_connect(&ec, &mut ep)
+        let ep = match Endpoint::connect(&endpoint_config(&url, s.insecure, s.draft)) {
+            Ok(ep) => ep,
+            Err(e) => {
+                gst::element_imp_error!(
+                    self,
+                    gst::ResourceError::OpenWrite,
+                    (
+                        "could not open MoQ endpoint to relay {}:{} (rc={})",
+                        s.host,
+                        s.port,
+                        e.code()
+                    )
+                );
+                *self.namespace.lock().unwrap() = None;
+                return false;
+            }
         };
-        if rc != MOQ_OK {
-            gst::element_imp_error!(
-                self,
-                gst::ResourceError::OpenWrite,
-                (
-                    "could not open MoQ endpoint to relay {}:{} (rc={})",
-                    s.host,
-                    s.port,
-                    rc
-                )
-            );
-            drop(ns_guard);
-            *self.namespace.lock().unwrap() = None;
-            return false;
-        }
-
-        let mut sc = moq_media_sender_cfg_t::default();
-        unsafe {
-            moq_media_sender_cfg_init_live_sized(&mut sc, std::mem::size_of_val(&sc));
-            moq_media_sender_callbacks_init_sized(
-                &mut sc.callbacks,
-                std::mem::size_of_val(&sc.callbacks),
-            );
-        }
-        let diagnostic = Box::new(ReadyDiagnostic {
-            namespace: s.namespace.clone(),
-        });
-        sc.callbacks.ctx = &*diagnostic as *const ReadyDiagnostic as *mut c_void;
-        sc.callbacks.on_ready = Some(on_ready);
-        // Push (contribution) mode: PUBLISH every track and write the catalog
-        // live so a relay that expects a publisher-initiated PUBLISH picks the
-        // stream up. Off by default -- announce-and-wait is what
-        // red5-moq-relay serves today.
-        sc.publish_tracks = s.publish_tracks;
-        // Republish the catalog on a timer only when explicitly requested for
-        // relay cache compatibility. Initial catalog completeness is provided
-        // by the atomic startup task, not by periodic publication.
-        //
-        // Set it only for a relay that does not pull that retained group on a
-        // late subscriber's behalf. MoQT permits a relay to answer a FETCH
-        // from its own cache alone and to be "catalog-blind", and libmoq
-        // documents the retained group as "NOT a relay-safe catalog solution"
-        // for exactly that reason, so such a relay delivers no catalog at all
-        // to a late joiner -- red5-moq-relay 1.6.40/1.7.8 answer the joining
-        // FETCH with REQUEST_ERROR 17. The periodic republish sidesteps it by
-        // making the catalog ordinary live content, which any relay forwards.
-        sc.catalog_refresh_interval_us = s.catalog_refresh_ms as u64 * 1000;
-        sc.endpoint = std::ptr::null();
-        sc.namespace_.parts = ns.parts();
-        sc.namespace_.count = ns.count();
 
         // CMSF 4 root contentProtections, authored by commit_tracks before the
         // pads were registered (the track cfgs reference these entries by
         // refID). The sender cfg carries them, so they are frozen with the
-        // rest of the initial catalog at attach. libmoq deep-copies every
-        // field, so the arrays only have to outlive the startup task. Each
-        // entry gets a single-element defaultKID array -- CMSF allows several
-        // KIDs per entry, but one init segment declares exactly one tenc
-        // default_KID.
-        let mut cp_kids: Vec<moq_bytes_t> = ts
+        // rest of the initial catalog at attach. Each entry gets a
+        // single-element defaultKID array -- CMSF allows several KIDs per
+        // entry, but one init segment declares exactly one tenc default_KID.
+        let cps: Vec<ContentProtection> = ts
             .cp_entries
             .iter()
-            .map(|e| span(e.kid_uuid.as_bytes()))
-            .collect();
-        let url_of = |u: &Option<String>| match u {
-            Some(u) => moq_cmsf_url_t {
-                present: true,
-                url: span(u.as_bytes()),
-                ..Default::default()
-            },
-            None => moq_cmsf_url_t::default(),
-        };
-        let cps: Vec<moq_cmsf_content_protection_t> = ts
-            .cp_entries
-            .iter()
-            .enumerate()
-            .map(|(i, e)| {
-                let mut cp = moq_cmsf_content_protection_t {
-                    ref_id: span(e.ref_id.as_bytes()),
-                    default_kids: unsafe { cp_kids.as_mut_ptr().add(i) },
-                    default_kid_count: 1,
-                    scheme: span(e.scheme.as_bytes()),
-                    ..Default::default()
-                };
-                let d = &mut cp.drm_system;
-                d.system_id = span(e.system_id.as_bytes());
-                d.la_url = url_of(&e.la_url);
-                d.cert_url = url_of(&e.cert_url);
-                d.auth_url = url_of(&e.auth_url);
-                if let Some(p) = &e.pssh {
-                    d.has_pssh = true;
-                    d.pssh = span(p.as_bytes());
-                }
-                if let Some(r) = &e.robustness {
-                    d.has_robustness = true;
-                    d.robustness = span(r.as_bytes());
-                }
-                cp
+            .map(|e| ContentProtection {
+                ref_id: e.ref_id.clone(),
+                default_kids: vec![e.kid_uuid.clone()],
+                scheme: e.scheme.clone(),
+                drm_system: DrmSystem {
+                    system_id: e.system_id.clone(),
+                    la_url: e.la_url.clone().map(CmsfUrl::new),
+                    cert_url: e.cert_url.clone().map(CmsfUrl::new),
+                    auth_url: e.auth_url.clone().map(CmsfUrl::new),
+                    pssh: e.pssh.clone(),
+                    robustness: e.robustness.clone(),
+                },
             })
             .collect();
         let cp_count = cps.len();
-        if cp_count > 0 {
-            sc.content_protections = cps.as_ptr();
-            sc.content_protection_count = cp_count;
-        }
 
-        let task = SenderStartup {
-            flags: Mutex::new(StartupFlags::default()),
-            cond: Condvar::new(),
-            cfg: sc,
-            sender: AtomicPtr::new(std::ptr::null_mut()),
-            tracks: Mutex::new(ts.preparing_tracks.take().unwrap_or_default()),
-        };
-        let mut rc = unsafe {
-            moq_endpoint_post(
-                ep,
-                Some(start_sender_task),
-                &task as *const SenderStartup as *mut c_void,
-            )
-        };
-        if rc == MOQ_OK {
-            let deadline = clock::monotonic_us() + EOS_DRAIN_TIMEOUT_US;
-            let mut f = task.flags.lock().unwrap();
-            let mut timed_out = false;
-            while !f.done {
-                let cancelled = {
-                    let st = self.obj_lock();
-                    st.state_flushing || st.flush_count > 0
-                };
-                if cancelled || clock::monotonic_us() >= deadline {
-                    timed_out = !cancelled;
-                    f.cancelled = true;
-                    // A running task only performs finite attach/add calls.
-                    // Settle it before app-thread destruction; an unstarted
-                    // task runs closed in stop.
-                    while f.running && !f.done {
-                        f = task.cond.wait(f).unwrap();
+        // Network callback: no waiting, locks or dependency on the element.
+        let ready_ns = s.namespace.clone();
+        let cfg = SenderConfig::live(ns)
+            .on_ready(move || {
+                gst::info!(CAT, "native sender ready namespace={}", ready_ns);
+            })
+            // Push (contribution) mode: PUBLISH every track and write the
+            // catalog live so a relay that expects a publisher-initiated
+            // PUBLISH picks the stream up. Off by default -- announce-and-wait
+            // is what red5-moq-relay serves today.
+            .publish_tracks(s.publish_tracks)
+            // Republish the catalog on a timer only when explicitly requested
+            // for relay cache compatibility. Initial catalog completeness is
+            // provided by the atomic startup task, not by periodic publication.
+            //
+            // Set it only for a relay that does not pull that retained group
+            // on a late subscriber's behalf. MoQT permits a relay to answer a
+            // FETCH from its own cache alone and to be "catalog-blind", and
+            // libmoq documents the retained group as "NOT a relay-safe catalog
+            // solution" for exactly that reason, so such a relay delivers no
+            // catalog at all to a late joiner -- red5-moq-relay 1.6.40/1.7.8
+            // answer the joining FETCH with REQUEST_ERROR 17. The periodic
+            // republish sidesteps it by making the catalog ordinary live
+            // content, which any relay forwards.
+            .catalog_refresh_interval(Duration::from_millis(s.catalog_refresh_ms as u64))
+            .content_protections(cps);
+
+        // Attach and add every prepared track in one posted task, which the
+        // endpoint runs before its first sender pump, so the initial catalog
+        // carries them all.
+        let (pads, tracks): (Vec<MoqSinkPad>, Vec<TrackConfig>) = ts
+            .preparing_tracks
+            .take()
+            .unwrap_or_default()
+            .into_iter()
+            .unzip();
+        let started = match MediaSender::start(&ep, cfg, tracks) {
+            Err(e) => Err(e.code()),
+            Ok(mut startup) => {
+                let deadline = clock::monotonic_us() + EOS_DRAIN_TIMEOUT_US;
+                loop {
+                    startup = match startup.wait(Duration::ZERO) {
+                        StartupStatus::Done(r) => break r.map_err(|e| e.code()),
+                        StartupStatus::Pending(p) => p,
+                    };
+                    let cancelled = {
+                        let st = self.obj_lock();
+                        st.state_flushing || st.flush_count > 0
+                    };
+                    if cancelled || clock::monotonic_us() >= deadline {
+                        // A running task only performs finite attach/add
+                        // calls: cancel settles it before destroying what it
+                        // made. An unstarted task runs closed in stop.
+                        startup.cancel();
+                        break Err(if cancelled {
+                            MOQ_ERR_INTERRUPTED
+                        } else {
+                            MOQ_DONE
+                        });
                     }
-                    break;
+                    let wait = (deadline - clock::monotonic_us()).clamp(0, 5000) as u64;
+                    startup = match startup.wait(Duration::from_micros(wait)) {
+                        StartupStatus::Done(r) => break r.map_err(|e| e.code()),
+                        StartupStatus::Pending(p) => p,
+                    };
                 }
-                let wait = (deadline - clock::monotonic_us()).clamp(0, 5000) as u64;
-                f = task
-                    .cond
-                    .wait_timeout(f, Duration::from_micros(wait))
-                    .unwrap()
-                    .0;
             }
-            rc = if f.cancelled {
-                if timed_out {
-                    MOQ_DONE
-                } else {
-                    MOQ_ERR_INTERRUPTED
+        };
+        let sender = match started {
+            Ok((sender, tracks)) => {
+                for (pad, track) in pads.iter().zip(tracks) {
+                    let _st = self.obj_lock();
+                    pad.set_track(Some(track));
                 }
-            } else {
-                f.result
-            };
-        }
-        let sender = task.sender.load(Ordering::SeqCst);
-        if rc != MOQ_OK {
-            unsafe {
-                if !sender.is_null() {
-                    moq_media_sender_destroy(sender);
-                }
-                // Completes a queued callback with session==NULL before its
-                // ctx expires.
-                moq_endpoint_stop(ep);
-                moq_endpoint_destroy(ep);
+                sender
             }
-        } else {
-            for t in task.tracks.lock().unwrap().iter() {
-                let _st = self.obj_lock();
-                t.pad.set_track(t.track);
+            Err(rc) => {
+                // The last handle: stopping completes a queued startup task
+                // with no session before the endpoint goes.
+                drop(ep);
+                gst::element_imp_error!(
+                    self,
+                    gst::ResourceError::OpenWrite,
+                    (
+                        "could not prepare MoQ sender (rc={}){}",
+                        rc,
+                        if cp_count > 0 {
+                            " -- check drm-systems: a systemID must be a \"8-4-4-4-12\" UUID string"
+                        } else {
+                            ""
+                        }
+                    )
+                );
+                *self.namespace.lock().unwrap() = None;
+                return false;
             }
-        }
-        // The task has settled (or been run closed by the stop above), so the
-        // authored arrays can go.
-        drop(task);
-        drop(cps);
-        drop(cp_kids);
-        if rc != MOQ_OK {
-            gst::element_imp_error!(
-                self,
-                gst::ResourceError::OpenWrite,
-                (
-                    "could not prepare MoQ sender (rc={}){}",
-                    rc,
-                    if cp_count > 0 {
-                        " -- check drm-systems: a systemID must be a \"8-4-4-4-12\" UUID string"
-                    } else {
-                        ""
-                    }
-                )
-            );
-            drop(diagnostic);
-            drop(ns_guard);
-            *self.namespace.lock().unwrap() = None;
-            return false;
-        }
+        };
         if cp_count > 0 {
             gst::info!(
                 CAT,
@@ -2500,12 +2193,11 @@ impl MoqSink {
         }
         {
             let mut send = self.send_lock();
-            send.sender = Handle(sender);
-            send.ready_diagnostic = Some(diagnostic);
+            send.sender = Some(sender);
             send.sender_generation += 1;
             let mut st = self.obj_lock();
-            st.ep = Handle(ep);
-            unsafe { moq_endpoint_set_interrupted(ep, st.state_flushing || st.flush_count > 0) };
+            ep.set_interrupted(st.state_flushing || st.flush_count > 0);
+            st.ep = Some(ep);
         }
 
         gst::info!(
@@ -2529,32 +2221,21 @@ impl MoqSink {
             let mut send = self.send_lock();
             let ep = {
                 let mut st = self.obj_lock();
-                let ep = std::mem::take(&mut st.ep);
-                if !ep.is_null() {
-                    unsafe { moq_endpoint_set_interrupted(ep.get(), true) };
+                let ep = st.ep.take();
+                if let Some(ep) = &ep {
+                    ep.set_interrupted(true);
                 }
                 ep
             };
 
-            if !send.sender.is_null() {
-                // get_stats, destroy and clearing the sender all happen under
-                // one critical section so a concurrent streaming-thread call
-                // (which only ever checks the sender under this same lock) can
-                // never observe a freed sender.
-                let mut stats = moq_media_sender_stats_t::default();
-                let stats_rc = unsafe {
-                    moq_media_sender_get_stats(
-                        send.sender.get(),
-                        &mut stats,
-                        std::mem::size_of_val(&stats),
-                    )
-                };
-                unsafe { moq_media_sender_destroy(send.sender.get()) };
-                send.sender = Handle::null();
-                // detach/destruction settles callbacks before the diagnostic
-                // is freed.
-                send.ready_diagnostic = None;
-                if stats_rc == MOQ_OK {
+            if let Some(sender) = send.sender.take() {
+                // get_stats and destroying the sender both happen inside the
+                // send lock, so a concurrent streaming-thread call (which only
+                // ever reaches the sender under this same lock) can never see
+                // a destroyed one. Destroying settles its callbacks first.
+                let stats = sender.stats();
+                drop(sender);
+                if let Ok(stats) = stats {
                     gst::info!(
                         CAT,
                         imp = self,
@@ -2567,19 +2248,15 @@ impl MoqSink {
                 }
             }
             send.end_requests.clear();
-            if !ep.is_null() {
-                unsafe {
-                    moq_endpoint_stop(ep.get());
-                    moq_endpoint_destroy(ep.get());
-                }
-            }
+            // The last endpoint handle: stops and destroys it.
+            drop(ep);
         }
 
         let pads = self.sink_pads();
         {
             let _st = self.obj_lock();
             for p in &pads {
-                p.set_track(Handle::null());
+                p.set_track(None);
             }
         }
 
@@ -2813,8 +2490,8 @@ impl ObjectImpl for MoqSink {
 
         let templ = klass.pad_template("sink").unwrap();
         let video = PadKind {
-            media_type: MOQ_MEDIA_TYPE_VIDEO,
-            packaging: MOQ_MEDIA_PACKAGING_RAW,
+            media_type: MediaType::Video,
+            packaging: Packaging::Loc,
         };
         let pad = self.new_pad(
             &templ,
@@ -2829,8 +2506,8 @@ impl ObjectImpl for MoqSink {
 
         let templ = klass.pad_template("audio").unwrap();
         let audio = PadKind {
-            media_type: MOQ_MEDIA_TYPE_AUDIO,
-            packaging: MOQ_MEDIA_PACKAGING_RAW,
+            media_type: MediaType::Audio,
+            packaging: Packaging::Loc,
         };
         let pad = self.new_pad(
             &templ,
@@ -2922,8 +2599,8 @@ impl ElementImpl for MoqSink {
                             id.unschedule();
                         }
                     }
-                    if !st.ep.is_null() {
-                        unsafe { moq_endpoint_set_interrupted(st.ep.get(), true) };
+                    if let Some(ep) = &st.ep {
+                        ep.set_interrupted(true);
                     }
                 }
                 // Release any pad parked in the track barrier: going to READY
@@ -2946,8 +2623,8 @@ impl ElementImpl for MoqSink {
                     p.set_flushing(p.flush_pending());
                 }
                 st.eos_posted = false;
-                if !st.ep.is_null() {
-                    unsafe { moq_endpoint_set_interrupted(st.ep.get(), st.flush_count > 0) };
+                if let Some(ep) = &st.ep {
+                    ep.set_interrupted(st.flush_count > 0);
                 }
             }
             gst::StateChange::PausedToReady => {
@@ -3005,11 +2682,11 @@ impl ElementImpl for MoqSink {
         let max_fragment = self.settings.lock().unwrap().max_fragment_size as usize;
         let kind = PadKind {
             media_type: if is_audio {
-                MOQ_MEDIA_TYPE_AUDIO
+                MediaType::Audio
             } else {
-                MOQ_MEDIA_TYPE_VIDEO
+                MediaType::Video
             },
-            packaging: MOQ_MEDIA_PACKAGING_CMAF,
+            packaging: Packaging::Cmaf,
         };
         let pad = self.new_pad(
             templ,

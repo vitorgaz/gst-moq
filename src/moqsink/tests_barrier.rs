@@ -15,8 +15,9 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use super::MoqSink;
-use crate::moq::*;
-use crate::test_support::{serial, span_dup, zero_sized, Addr};
+use crate::test_support::{bytes, serial, span, span_dup, zero_sized, Addr};
+use moq5::sys::*;
+use moq5::testing::{install, Api, ApiGuard, REAL};
 
 // -- call log ------------------------------------------------------------------
 
@@ -253,7 +254,8 @@ unsafe extern "C" fn endpoint_wait(_ep: *mut moq_endpoint_t, _us: u64) -> moq_re
 unsafe extern "C" fn endpoint_cfg_init(c: *mut moq_endpoint_cfg_t) {
     zero_sized(c, |c, n| c.struct_size = n);
 }
-unsafe extern "C" fn track_cfg_init(c: *mut moq_media_track_cfg_t) {
+unsafe extern "C" fn track_cfg_init(c: *mut moq_media_track_cfg_t, n: usize) {
+    assert_eq!(n, std::mem::size_of::<moq_media_track_cfg_t>());
     zero_sized(c, |c, n| c.struct_size = n);
 }
 unsafe extern "C" fn sender_cfg_init_live_sized(c: *mut moq_media_sender_cfg_t, n: usize) {
@@ -396,7 +398,7 @@ const API: Api = Api {
     moq_media_sender_callbacks_init_sized: sender_callbacks_init_sized,
     moq_media_sender_attach: sender_attach,
     moq_media_sender_destroy: sender_destroy,
-    moq_media_track_cfg_init: track_cfg_init,
+    moq_media_track_cfg_init_sized: track_cfg_init,
     moq_media_sender_add_track: sender_add_track,
     moq_media_sender_write: sender_write,
     moq_media_sender_end_track: sender_end_track,

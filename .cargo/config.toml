@@ -1,0 +1,6 @@
+# Where moq5-sys finds the installed libmoq (headers and static archives).
+# Its own default is relative to its source, which is cargo's git checkout
+# here, so name the prefix next to this repository instead. An MOQ_PREFIX
+# already set in the environment wins.
+[env]
+MOQ_PREFIX = { value = "../local-prefix", relative = true }

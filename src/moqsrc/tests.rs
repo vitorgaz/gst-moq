@@ -10,8 +10,10 @@ use std::sync::atomic::AtomicU8;
 use std::sync::{Mutex, MutexGuard};
 
 use super::MoqSrc;
-use crate::moq::*;
-use crate::test_support::{serial, Addr};
+use crate::test_support::{serial, span, Addr};
+use moq5::sys::*;
+use moq5::testing::{install, Api, ApiGuard, REAL};
+use moq5::{Endpoint, MediaReceiver};
 
 static RECEIVER_ID: AtomicU8 = AtomicU8::new(0);
 static VIDEO_HANDLE: AtomicU8 = AtomicU8::new(0);
@@ -151,6 +153,9 @@ unsafe extern "C" fn negotiated_version(_ep: *const moq_endpoint_t) -> moq_versi
 // -- startup mocks -------------------------------------------------------------
 
 fn startup_call(ep: *const moq_endpoint_t, call: &str) {
+    if std::thread::panicking() {
+        return; // a failed test unwinding through the fixture's handles
+    }
     let mut rc = receiver();
     assert!(rc.startup_active);
     assert_eq!(ep, handle::<moq_endpoint_t>(&ENDPOINT_HANDLE));
@@ -219,6 +224,9 @@ unsafe extern "C" fn receiver_attach(
     MOQ_ERR_CLOSED
 }
 unsafe extern "C" fn receiver_destroy(_r: *mut moq_media_receiver_t) {
+    if std::thread::panicking() {
+        return; // a failed test unwinding through the fixture's handles
+    }
     unreachable!("moq_media_receiver_destroy");
 }
 
@@ -264,7 +272,13 @@ fn make_source() -> MoqSrc {
     let src = gst::glib::Object::new::<MoqSrc>();
     src.imp().settings.lock().unwrap().caps = Some(gst::Caps::new_any());
     let mut st = src.imp().lock_state();
-    st.receiver = Handle(handle(&RECEIVER_ID));
+    // SAFETY: fixture handles; release() takes them back before any drop.
+    st.receiver = Some(unsafe {
+        MediaReceiver::from_raw(
+            handle(&RECEIVER_ID),
+            Endpoint::from_raw(handle(&ENDPOINT_HANDLE)),
+        )
+    });
     st.caps_pushed = true; // Negotiation is exercised separately by pipelines.
     st.discover_deadline = i64::MAX;
     drop(st);
@@ -273,7 +287,12 @@ fn make_source() -> MoqSrc {
 
 /// Detach the mock receiver before the element goes away.
 fn release(src: MoqSrc) {
-    src.imp().lock_state().receiver = Handle::null();
+    // Neither fixture handle may reach destroy/stop: take them back raw.
+    if let Some(r) = src.imp().lock_state().receiver.take() {
+        let (_, ep) = r.into_raw();
+        ep.into_raw()
+            .expect("the fixture holds the only endpoint handle");
+    }
 }
 
 fn queue_object(handle_of: &'static AtomicU8, payload: &'static [u8]) {
@@ -379,7 +398,12 @@ fn selected_removal_drains() {
 fn unrelated_end() {
     let _suite = suite();
     let src = make_source();
-    src.imp().lock_state().want_track = Handle(handle(&VIDEO_HANDLE));
+    {
+        let mut st = src.imp().lock_state();
+        let r = st.receiver.as_ref().unwrap();
+        // SAFETY: a fixture track of the fixture receiver.
+        st.want_track = Some(unsafe { r.track_from_raw(handle(&VIDEO_HANDLE)) });
+    }
     receiver().events = vec![terminal(MOQ_MEDIA_TRACK_ENDED, &AUDIO_HANDLE)];
     assert_eq!(create(&src).err(), Some(gst::FlowError::Flushing));
     assert_eq!(receiver().waits, 1);
@@ -413,7 +437,7 @@ fn subscription_failure() {
     let video = desc("video", "avc1.42c01e");
     receiver().events = vec![added(&VIDEO_HANDLE, &video)];
     assert_eq!(create(&src).err(), Some(gst::FlowError::Error));
-    assert!(src.imp().lock_state().want_track.is_null());
+    assert!(src.imp().lock_state().want_track.is_none());
     assert_eq!(receiver().waits, 0);
     release(src);
 }
@@ -531,14 +555,10 @@ fn startup_terminal(mode: u32) {
         assert_eq!(rc.startup_calls, "connect;attach;get;log;stop;destroy;");
         assert_eq!(rc.terminal_diagnostic.as_deref(), Some(expected));
     }
-    assert!(src
-        .imp()
-        .ep
-        .load(std::sync::atomic::Ordering::SeqCst)
-        .is_null());
+    assert!(src.imp().ep.lock().unwrap().is_none());
     {
         let st = src.imp().lock_state();
-        assert!(st.receiver.is_null());
+        assert!(st.receiver.is_none());
         assert!(!st.started);
     }
     let message = bus.pop().expect("an error message");

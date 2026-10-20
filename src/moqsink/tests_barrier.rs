@@ -583,7 +583,7 @@ fn initial_catalog_complete() {
     assert!(sink.set_state(gst::State::Paused).is_ok());
 
     let asrc = open_src_pad(&sink, "audio", "audio-stream", audio_caps());
-    let vsrc = open_src_pad(&sink, "sink", "video-stream", video_caps());
+    let vsrc = open_src_pad(&sink, "video", "video-stream", video_caps());
 
     // Audio first, on its own streaming thread: it must park in the barrier.
     let (job, th) = PushJob::start(&asrc, keyframe(gst::ClockTime::ZERO, 64));
@@ -639,7 +639,7 @@ fn unlinked_pad_excluded() {
     assert!(sink.set_state(gst::State::Paused).is_ok());
 
     // "audio" deliberately left unlinked.
-    let vsrc = open_src_pad(&sink, "sink", "video-stream", video_caps());
+    let vsrc = open_src_pad(&sink, "video", "video-stream", video_caps());
 
     log_add(Op::Mark, Some("push-video"));
     assert_eq!(vsrc.push(keyframe(gst::ClockTime::ZERO, 64)), OK);
@@ -665,7 +665,7 @@ fn timeout_no_partial() {
     sink.set_bus(Some(&bus));
     let _ = sink.set_state(gst::State::Paused);
     let asrc = open_src_pad(&sink, "audio", "a", audio_caps());
-    let vsrc = open_src_pad(&sink, "sink", "v", video_caps());
+    let vsrc = open_src_pad(&sink, "video", "v", video_caps());
     assert_eq!(
         asrc.push(keyframe(gst::ClockTime::ZERO, 64)),
         Err(gst::FlowError::Error)
@@ -686,7 +686,7 @@ fn empty_eos() {
     let bus = gst::Bus::new();
     sink.set_bus(Some(&bus));
     let _ = sink.set_state(gst::State::Paused);
-    let src = open_src_pad(&sink, "sink", "v", video_caps());
+    let src = open_src_pad(&sink, "video", "v", video_caps());
     assert!(src.push_event(gst::event::Eos::new()));
     assert_eq!(log_count(Op::Connect), 0);
     let m = bus
@@ -717,7 +717,7 @@ fn flush_cancels(state_change: bool) {
     sink.set_property("catalog-wait-ms", 5000u32);
     let _ = sink.set_state(gst::State::Paused);
     let asrc = open_src_pad(&sink, "audio", "a", audio_caps());
-    let vsrc = open_src_pad(&sink, "sink", "v", video_caps());
+    let vsrc = open_src_pad(&sink, "video", "v", video_caps());
     let (job, th) = PushJob::start(&asrc, keyframe(gst::ClockTime::ZERO, 64));
     assert!(wait_task_until(|t| t.barrier_waiting));
     if state_change {
@@ -759,7 +759,7 @@ fn start_failure(mode: u32) {
     }
     let sink = new_sink();
     let _ = sink.set_state(gst::State::Paused);
-    let src = open_src_pad(&sink, "sink", "v", video_caps());
+    let src = open_src_pad(&sink, "video", "v", video_caps());
     if mode == 0 {
         let (job, th) = PushJob::start(&src, keyframe(gst::ClockTime::ZERO, 64));
         assert!(wait_task_until(|t| t.task_queued));
@@ -809,7 +809,7 @@ fn partial_add_failed() {
     let sink = new_sink();
     let _ = sink.set_state(gst::State::Paused);
     let asrc = open_src_pad(&sink, "audio", "a", audio_caps());
-    let vsrc = open_src_pad(&sink, "sink", "v", video_caps());
+    let vsrc = open_src_pad(&sink, "video", "v", video_caps());
     let (job, th) = PushJob::start(&asrc, keyframe(gst::ClockTime::ZERO, 64));
     assert_eq!(
         vsrc.push(keyframe(gst::ClockTime::ZERO, 64)),
@@ -833,10 +833,10 @@ fn running_start_cancel() {
     }
     let sink = new_sink();
     let _ = sink.set_state(gst::State::Paused);
-    let src = open_src_pad(&sink, "sink", "v", video_caps());
+    let src = open_src_pad(&sink, "video", "v", video_caps());
     let (job, th) = PushJob::start(&src, keyframe(gst::ClockTime::ZERO, 64));
     assert!(wait_task_until(|t| t.running_entered));
-    let sinkpad = sink.static_pad("sink").unwrap();
+    let sinkpad = sink.static_pad("video").unwrap();
     // The pad's public flushing flag is set by FLUSH_START before the handler
     // runs; release the held attach only once it is.
     let release = std::thread::spawn(move || {
@@ -913,7 +913,7 @@ fn capture_and_groups() {
     let sink = new_sink();
     let _ = sink.set_state(gst::State::Paused);
     let asrc = open_src_pad(&sink, "audio", "a", audio_caps());
-    let vsrc = open_src_pad(&sink, "sink", "v", video_caps());
+    let vsrc = open_src_pad(&sink, "video", "v", video_caps());
     // Common encoder offset: video PTS is large but running time is zero.
     let offset = gst::ClockTime::from_seconds(3_600_000);
     push_segment(&vsrc, offset);

@@ -138,14 +138,14 @@ property block verbatim, and the two drafts encode its integers differently
 
 ### LOC with audio
 
-The always pads are `sink` (H.264 byte-stream) and `audio` (raw AAC access
+The always pads are `video` (H.264 byte-stream) and `audio` (raw AAC access
 units). Each publishes a LOC-01 track into the same catalog, so a LOC broadcast
 can carry video and audio:
 
 ```sh
 gst-launch-1.0 -e moqsink name=ms host=RELAY port=4433 relay-path=/moq namespace=example \
   videotestsrc is-live=true ! x264enc tune=zerolatency key-int-max=30 ! h264parse config-interval=-1 \
-    ! video/x-h264,stream-format=byte-stream,alignment=au ! ms.sink \
+    ! video/x-h264,stream-format=byte-stream,alignment=au ! ms.video \
   audiotestsrc is-live=true ! voaacenc ! aacparse \
     ! audio/mpeg,mpegversion=4,stream-format=raw ! ms.audio
 ```

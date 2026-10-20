@@ -891,7 +891,7 @@ impl MoqSink {
     /// TRUE when every LINKED pad has either prepared its track or dropped out
     /// (EOS/flushing means it will never deliver one), and at least one did
     /// prepare. Unlinked pads are excluded exactly as in claim_eos: the always
-    /// "sink"/"audio" pads exist even in a CMAF-only pipeline that uses only
+    /// "video"/"audio" pads exist even in a CMAF-only pipeline that uses only
     /// the request pads. Caller holds the track lock.
     fn tracks_ready(&self) -> bool {
         let pads = self.sink_pads();
@@ -2488,14 +2488,14 @@ impl ObjectImpl for MoqSink {
         let obj = self.obj();
         let klass = obj.element_class();
 
-        let templ = klass.pad_template("sink").unwrap();
+        let templ = klass.pad_template("video").unwrap();
         let video = PadKind {
             media_type: MediaType::Video,
             packaging: Packaging::Loc,
         };
         let pad = self.new_pad(
             &templ,
-            "sink",
+            "video",
             video,
             DEFAULT_TRACK_NAME,
             DEFAULT_BITRATE,
@@ -2553,7 +2553,7 @@ impl ElementImpl for MoqSink {
             };
             vec![
                 t(
-                    "sink",
+                    "video",
                     gst::PadPresence::Always,
                     "video/x-h264, stream-format = (string) { avc, byte-stream }, alignment = (string) au",
                 ),

@@ -16,7 +16,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{LazyLock, Mutex, MutexGuard, OnceLock};
 
 use moq5::cmaf::CmafInit;
-use moq5::{MediaTrack, MediaType, Packaging};
+use moq5::{MediaType, Packaging};
+
+use crate::service::SendTrack;
 
 use crate::fmp4::Splitter;
 
@@ -130,10 +132,10 @@ impl MoqSinkPad {
         self.imp().settings.lock().unwrap().bitrate
     }
 
-    pub fn track(&self) -> Option<MediaTrack> {
+    pub(crate) fn track(&self) -> Option<SendTrack> {
         *self.imp().track.lock().unwrap()
     }
-    pub fn set_track(&self, t: Option<MediaTrack>) {
+    pub(crate) fn set_track(&self, t: Option<SendTrack>) {
         *self.imp().track.lock().unwrap() = t;
     }
 
@@ -230,7 +232,7 @@ pub mod imp {
         pub(super) flush_pending: AtomicBool,
         pub(super) pend_ready: AtomicBool,
         /// None until the track is added
-        pub(super) track: Mutex<Option<MediaTrack>>,
+        pub(super) track: Mutex<Option<SendTrack>>,
         pub(super) objects_sent: AtomicU64,
         pub(super) clock_id: Mutex<Option<gst::SingleShotClockId>>,
         pub(super) state: Mutex<PadState>,

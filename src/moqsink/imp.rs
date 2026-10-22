@@ -13,7 +13,7 @@
 //!
 //! The service tier owns the network thread, version negotiation, the sticky
 //! catalog and the bounded per-track send queues; chain functions only
-//! translate buffers into media objects. MediaSender::write() takes the
+//! translate buffers into media objects. Sender::write() takes the
 //! payload on success and libmoq drops our buffer reference when it releases
 //! it (on the network thread).
 //!
@@ -61,9 +61,11 @@ use moq5::sys::{
     MOQ_ERR_WOULD_BLOCK, MOQ_ERR_WRONG_STATE, MOQ_OK,
 };
 use moq5::{
-    CmsfUrl, ContentProtection, DrmSystem, Endpoint, MediaSender, MediaTrack, MediaType, Namespace,
-    Packaging, RcBuf, SapType, SendObject, SenderConfig, StartupStatus, TrackConfig, Wait,
+    Buffer, CmsfUrl, ContentProtection, DrmSystem, MediaType, Namespace, Packaging, SapType,
+    SendObject, WaitResult,
 };
+
+use crate::service::{Endpoint, SendTrack, Sender, SenderCfg, TrackCfg};
 
 use super::pad::{MoqSinkPad, PadKind};
 use crate::clock;
@@ -198,7 +200,7 @@ impl Default for ObjState {
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct EndRequest {
-    track: MediaTrack,
+    track: SendTrack,
     deadline: i64,
     accepted: bool,
 }
@@ -207,7 +209,7 @@ pub(crate) struct EndRequest {
 #[derive(Default)]
 pub(crate) struct SendState {
     /// Holds the endpoint too; its on_ready context lives as long as it.
-    pub(crate) sender: Option<MediaSender>,
+    pub(crate) sender: Option<Sender>,
     pub(crate) eos_failed: bool,
     pub(crate) sender_generation: u64,
     /// sender-owned; survives pad release
@@ -241,7 +243,7 @@ pub(crate) struct CpEntry {
 pub(crate) struct TrackState {
     /// app-thread snapshot, collected while committing: each pad with the
     /// track the startup task adds for it
-    pub(crate) preparing_tracks: Option<Vec<(MoqSinkPad, TrackConfig)>>,
+    pub(crate) preparing_tracks: Option<Vec<(MoqSinkPad, TrackCfg)>>,
     pub(crate) tracks_committed: bool,
     pub(crate) tracks_failed: bool,
     /// CMSF 4.1.1 root contentProtections authored for this session, built at
@@ -260,7 +262,7 @@ fn eos_remaining(deadline: i64) -> u64 {
     remaining.max(0) as u64
 }
 
-fn eos_end(ep: &Endpoint, sender: &MediaSender, track: MediaTrack, deadline: i64) -> moq_result_t {
+fn eos_end(ep: &Endpoint, sender: &Sender, track: SendTrack, deadline: i64) -> moq_result_t {
     loop {
         if sender.is_fatal() {
             return MOQ_ERR_CLOSED;
@@ -291,8 +293,8 @@ fn eos_drain(ep: &Endpoint, deadline: i64) -> moq_result_t {
     match eos_remaining(deadline) {
         0 => MOQ_DONE,
         remaining => match ep.drain(Duration::from_micros(remaining)) {
-            Ok(Wait::Ready) => MOQ_OK,
-            Ok(Wait::TimedOut) => MOQ_DONE,
+            Ok(WaitResult::Ready) => MOQ_OK,
+            Ok(WaitResult::TimedOut) => MOQ_DONE,
             Err(e) => e.code(),
         },
     }
@@ -579,7 +581,7 @@ impl MoqSink {
 
     // -- clock sync ----------------------------------------------------------
 
-    /// Wait until the buffer's running time when sync is on. Returns FLUSHING
+    /// WaitResult until the buffer's running time when sync is on. Returns FLUSHING
     /// if the wait was unscheduled by a flush or state change.
     fn sync(&self, pad: &MoqSinkPad, ts: Option<gst::ClockTime>) -> Flow {
         if !self.settings.lock().unwrap().sync {
@@ -713,7 +715,7 @@ impl MoqSink {
         &self,
         ts: &mut TrackState,
         pad: &MoqSinkPad,
-        cfg: TrackConfig,
+        cfg: TrackCfg,
     ) -> moq_result_t {
         if let Some(prep) = ts.preparing_tracks.as_mut() {
             prep.push((pad.clone(), cfg));
@@ -725,7 +727,7 @@ impl MoqSink {
             None => MOQ_ERR_CLOSED,
             Some(_) if pad.eos() || pad.flushing() || st.eos_posted => MOQ_ERR_WRONG_STATE,
             Some(sender) => {
-                let track = sender.add_track(cfg);
+                let track = sender.add_track(&cfg);
                 let r = rc(&track);
                 pad.set_track(track.ok());
                 r
@@ -747,7 +749,7 @@ impl MoqSink {
             // initData for the same reason avcC does on the video pad: a
             // subscriber cannot configure a decoder from the access units
             // alone.
-            let tc = TrackConfig::new(&track_name, MediaType::Audio, Packaging::Loc, &codec)
+            let tc = TrackCfg::new(&track_name, MediaType::Audio, Packaging::Raw, &codec)
                 .bitrate(bitrate)
                 .samplerate(s.rate as u32)
                 .channel_config(chan_cfg)
@@ -842,7 +844,7 @@ impl MoqSink {
             let s = pad.state();
             let codec = s.pend_codec.clone().unwrap_or_default();
 
-            let mut tc = TrackConfig::new(&track_name, MediaType::Video, Packaging::Loc, &codec)
+            let mut tc = TrackCfg::new(&track_name, MediaType::Video, Packaging::Raw, &codec)
                 .bitrate(bitrate);
             let init_len = s.pend_avcc.as_ref().map_or(0, |a| a.len());
             if let Some(avcc) = s.pend_avcc.clone() {
@@ -964,7 +966,7 @@ impl MoqSink {
         self.track_cond.notify_all();
     }
 
-    /// Wait for all linked pads, then create one immutable track snapshot.
+    /// WaitResult for all linked pads, then create one immutable track snapshot.
     /// The public endpoint task attaches/adds that snapshot in one managed
     /// turn before sender hooks run. Failure to prepare a linked stream is an
     /// error, never a successful partial catalog. Put queues on branches
@@ -1115,7 +1117,7 @@ impl MoqSink {
         // Zero-copy: libmoq drops the mapped buffer when it releases the
         // payload.
         let end = frame.len();
-        let payload = match RcBuf::from_owner_range(frame, skip..end) {
+        let payload = match crate::payload::wrap_owner(frame, skip..end) {
             Ok(p) => p,
             Err(_) => {
                 gst::element_imp_error!(self, gst::ResourceError::Write, ("rcbuf wrap failed"));
@@ -1296,7 +1298,7 @@ impl MoqSink {
             "2".to_string()
         };
 
-        let mut tc = TrackConfig::new(&track_name, kind.media_type, Packaging::Cmaf, &codec)
+        let mut tc = TrackCfg::new(&track_name, kind.media_type, Packaging::Cmaf, &codec)
             .bitrate(bitrate)
             .timescale(info.timescale())
             .init_data(init.data());
@@ -1410,7 +1412,7 @@ impl MoqSink {
 
         let len = frag.len();
         // Zero-copy: libmoq drops the fragment when it releases the payload.
-        let payload = match RcBuf::from_owner(frag) {
+        let payload = match Buffer::from_vec(frag) {
             Ok(p) => p,
             Err(_) => {
                 gst::element_imp_error!(self, gst::ResourceError::Write, ("rcbuf wrap failed"));
@@ -1542,7 +1544,7 @@ impl MoqSink {
     /// Keep accepted/deferred native obligations independently of Gst pads.
     /// Release serialization between retries so another track can keep
     /// writing.
-    fn end_handle(&self, track: MediaTrack, deadline: i64, generation: u64) -> moq_result_t {
+    fn end_handle(&self, track: SendTrack, deadline: i64, generation: u64) -> moq_result_t {
         loop {
             let (rc, remaining) = {
                 let mut guard = self.send_lock();
@@ -1740,7 +1742,7 @@ impl MoqSink {
                     .unwrap_or((0, 0));
                 s.fps_n = n;
                 s.fps_d = d;
-                if kind.media_type == MediaType::Video && kind.packaging == Packaging::Loc {
+                if kind.media_type == MediaType::Video && kind.packaging == Packaging::Raw {
                     s.avc = st.get::<&str>("stream-format").ok() == Some("avc");
                     s.codec_data = if s.avc {
                         buffer_field("codec_data")
@@ -1748,7 +1750,7 @@ impl MoqSink {
                         None
                     };
                 }
-                if kind.is_audio() && kind.packaging == Packaging::Loc {
+                if kind.is_audio() && kind.packaging == Packaging::Raw {
                     s.rate = int("rate");
                     s.channels = int("channels");
                     s.codec_data = buffer_field("codec_data");
@@ -2085,12 +2087,7 @@ impl MoqSink {
             .collect();
         let cp_count = cps.len();
 
-        // Network callback: no waiting, locks or dependency on the element.
-        let ready_ns = s.namespace.clone();
-        let cfg = SenderConfig::live(ns)
-            .on_ready(move || {
-                gst::info!(CAT, "native sender ready namespace={}", ready_ns);
-            })
+        let cfg = SenderCfg::live(ns)
             // Push (contribution) mode: PUBLISH every track and write the
             // catalog live so a relay that expects a publisher-initiated
             // PUBLISH picks the stream up. Off by default -- announce-and-wait
@@ -2112,47 +2109,54 @@ impl MoqSink {
             .catalog_refresh_interval(Duration::from_millis(s.catalog_refresh_ms as u64))
             .content_protections(cps);
 
-        // Attach and add every prepared track in one posted task, which the
-        // endpoint runs before its first sender pump, so the initial catalog
-        // carries them all.
-        let (pads, tracks): (Vec<MoqSinkPad>, Vec<TrackConfig>) = ts
+        // Attach, then add every prepared track before the namespace can be
+        // accepted, so the initial catalog carries them all. libmoq publishes
+        // the catalog on acceptance -- a network round trip away -- while
+        // attach and add_track are local calls, so the tracks are in place
+        // first in practice. It is no longer guaranteed by construction: the
+        // posted endpoint task that made it atomic needs moq_endpoint_post,
+        // which the moq5 crate no longer exposes. A track added after
+        // readiness only republishes the catalog, so losing the race costs a
+        // transient one-track catalog, not a wrong one.
+        let (pads, tracks): (Vec<MoqSinkPad>, Vec<TrackCfg>) = ts
             .preparing_tracks
             .take()
             .unwrap_or_default()
             .into_iter()
             .unzip();
-        let started = match MediaSender::start(&ep, cfg, tracks) {
-            Err(e) => Err(e.code()),
-            Ok(mut startup) => {
-                let deadline = clock::monotonic_us() + EOS_DRAIN_TIMEOUT_US;
-                loop {
-                    startup = match startup.wait(Duration::ZERO) {
-                        StartupStatus::Done(r) => break r.map_err(|e| e.code()),
-                        StartupStatus::Pending(p) => p,
-                    };
-                    let cancelled = {
-                        let st = self.obj_lock();
-                        st.state_flushing || st.flush_count > 0
-                    };
-                    if cancelled || clock::monotonic_us() >= deadline {
-                        // A running task only performs finite attach/add
-                        // calls: cancel settles it before destroying what it
-                        // made. An unstarted task runs closed in stop.
-                        startup.cancel();
-                        break Err(if cancelled {
-                            MOQ_ERR_INTERRUPTED
-                        } else {
-                            MOQ_DONE
-                        });
-                    }
-                    let wait = (deadline - clock::monotonic_us()).clamp(0, 5000) as u64;
-                    startup = match startup.wait(Duration::from_micros(wait)) {
-                        StartupStatus::Done(r) => break r.map_err(|e| e.code()),
-                        StartupStatus::Pending(p) => p,
-                    };
-                }
+        // Dropping the sender on any early return destroys what was attached,
+        // which is what the startup task's cancel used to settle.
+        let started = (|| {
+            let sender = Sender::attach(&ep, &cfg).map_err(|e| e.code())?;
+            let mut handles = Vec::with_capacity(tracks.len());
+            for track in &tracks {
+                handles.push(sender.add_track(track).map_err(|e| e.code())?);
             }
-        };
+            let deadline = clock::monotonic_us() + EOS_DRAIN_TIMEOUT_US;
+            let ready_ns = s.namespace.clone();
+            while !sender.is_ready() {
+                let cancelled = {
+                    let st = self.obj_lock();
+                    st.state_flushing || st.flush_count > 0
+                };
+                if cancelled {
+                    return Err(MOQ_ERR_INTERRUPTED);
+                }
+                let now = clock::monotonic_us();
+                if now >= deadline {
+                    return Err(MOQ_DONE);
+                }
+                let wait = (deadline - now).clamp(0, 5000) as u64;
+                sender
+                    .wait(Duration::from_micros(wait))
+                    .map_err(|e| e.code())?;
+            }
+            // The readiness record operators look for. libmoq used to deliver
+            // it as a callback; it is polled now, so it is logged once here,
+            // where readiness is first observed.
+            gst::info!(CAT, "native sender ready namespace={}", ready_ns);
+            Ok((sender, handles))
+        })();
         let sender = match started {
             Ok((sender, tracks)) => {
                 for (pad, track) in pads.iter().zip(tracks) {
@@ -2491,7 +2495,7 @@ impl ObjectImpl for MoqSink {
         let templ = klass.pad_template("video").unwrap();
         let video = PadKind {
             media_type: MediaType::Video,
-            packaging: Packaging::Loc,
+            packaging: Packaging::Raw,
         };
         let pad = self.new_pad(
             &templ,
@@ -2507,7 +2511,7 @@ impl ObjectImpl for MoqSink {
         let templ = klass.pad_template("audio").unwrap();
         let audio = PadKind {
             media_type: MediaType::Audio,
-            packaging: Packaging::Loc,
+            packaging: Packaging::Raw,
         };
         let pad = self.new_pad(
             &templ,

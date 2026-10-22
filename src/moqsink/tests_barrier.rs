@@ -1,430 +1,60 @@
-//! Initial-catalog barrier and CMSF contentProtections.
+//! The track barrier: when `moqsink` opens a session, and with which tracks.
 //!
-//! Port of tests/test_track_barrier.c: real element and pad code with portable
-//! public-service mocks. The executor mock runs asynchronously; its first
-//! simulated sender pump snapshots the track inventory after the posted
-//! startup task. No relay or socket is used.
+//! Port of tests/test_sink_barrier.c. The element is the real one; the libmoq
+//! service is the double in [`crate::service::fake`], which records an ordered
+//! log of what the element asked for, so "connected too early" is an ordering
+//! violation rather than a race.
 
 use gst::prelude::*;
 
-use std::collections::HashMap;
-use std::ffi::c_void;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use super::MoqSink;
-use crate::test_support::{bytes, serial, span, span_dup, zero_sized, Addr};
-use moq5::sys::*;
-use moq5::testing::{install, Api, ApiGuard, REAL};
-
-// -- call log ------------------------------------------------------------------
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Op {
-    Mark,
-    Connect,
-    Attach,
-    AddTrack,
-    Write,
-}
-
-static CALL_LOG: Mutex<Vec<(Op, Option<String>)>> = Mutex::new(Vec::new());
-
-fn log_reset() {
-    CALL_LOG.lock().unwrap().clear();
-}
-
-fn log_add(op: Op, detail: Option<&str>) {
-    CALL_LOG
-        .lock()
-        .unwrap()
-        .push((op, detail.map(str::to_owned)));
-}
-
-/// Index of the first entry matching op (and detail, when given), or -1.
-fn log_find(op: Op, detail: Option<&str>) -> i64 {
-    CALL_LOG
-        .lock()
-        .unwrap()
-        .iter()
-        .position(|(o, d)| *o == op && (detail.is_none() || d.as_deref() == detail))
-        .map_or(-1, |i| i as i64)
-}
-
-fn log_count(op: Op) -> usize {
-    CALL_LOG
-        .lock()
-        .unwrap()
-        .iter()
-        .filter(|(o, _)| *o == op)
-        .count()
-}
-
-/// What the element handed libmoq at attach: the root contentProtections
-/// array (CMSF 4.1.1), flattened to strings.
-#[derive(Clone, Debug, Default)]
-struct Cp {
-    ref_id: Option<String>,
-    kid: Option<String>,
-    scheme: Option<String>,
-    system_id: Option<String>,
-    la_url: Option<String>,
-    pssh: Option<String>,
-}
-
-static ATTACHED_CPS: Mutex<Vec<Cp>> = Mutex::new(Vec::new());
-/// track name -> comma-joined contentProtectionRefIDs declared at add_track.
-static TRACK_REFS: Mutex<Option<HashMap<String, String>>> = Mutex::new(None);
-
-fn capture_reset() {
-    ATTACHED_CPS.lock().unwrap().clear();
-    *TRACK_REFS.lock().unwrap() = Some(HashMap::new());
-}
-
-fn track_refs(name: &str) -> Option<String> {
-    TRACK_REFS
-        .lock()
-        .unwrap()
-        .as_ref()
-        .and_then(|m| m.get(name).cloned())
-}
-
-// -- libmoq seams ----------------------------------------------------------------
-// Opaque handles the element only ever passes back to us.
-
-static FAKE_ENDPOINT: AtomicU8 = AtomicU8::new(0);
-static FAKE_SENDER: AtomicU8 = AtomicU8::new(0);
-static FAKE_TRACK_VIDEO: AtomicU8 = AtomicU8::new(0);
-static FAKE_TRACK_AUDIO: AtomicU8 = AtomicU8::new(0);
-
-fn handle<T>(a: &'static AtomicU8) -> *mut T {
-    a as *const AtomicU8 as *mut T
-}
-
-type TaskFn =
-    unsafe extern "C" fn(*mut moq_endpoint_t, *mut moq_session_t, u64, *mut c_void) -> moq_result_t;
-
-struct Task {
-    pending_fn: Option<TaskFn>,
-    pending_ctx: Addr,
-    pending_ep: Addr,
-    task_queued: bool,
-    hold_task: bool,
-    hold_running: bool,
-    running_entered: bool,
-    barrier_waiting: bool,
-    expected_tracks: u32,
-    pump_snapshots: u32,
-    task_closed: u32,
-    added_tracks: u32,
-    fail_add: u32,
-    fail_attach: bool,
-    fail_post: bool,
-    capture_video: u64,
-    capture_audio: u64,
-    audio_groups: u32,
-}
-
-impl Task {
-    const NEW: Task = Task {
-        pending_fn: None,
-        pending_ctx: Addr(0),
-        pending_ep: Addr(0),
-        task_queued: false,
-        hold_task: false,
-        hold_running: false,
-        running_entered: false,
-        barrier_waiting: false,
-        expected_tracks: 0,
-        pump_snapshots: 0,
-        task_closed: 0,
-        added_tracks: 0,
-        fail_add: 0,
-        fail_attach: false,
-        fail_post: false,
-        capture_video: 0,
-        capture_audio: 0,
-        audio_groups: 0,
-    };
-}
-
-static TASK: Mutex<Task> = Mutex::new(Task::NEW);
-static TASK_COND: Condvar = Condvar::new();
-static TASK_THREAD: Mutex<Option<JoinHandle<()>>> = Mutex::new(None);
-static INSIDE_TASK: AtomicBool = AtomicBool::new(false);
-
-fn task() -> MutexGuard<'static, Task> {
-    TASK.lock().unwrap_or_else(|e| e.into_inner())
-}
-
-/// Wait on the task condition until `done` holds or a second passes.
-fn wait_task_until(done: impl Fn(&Task) -> bool) -> bool {
-    let limit = Instant::now() + Duration::from_secs(1);
-    let mut t = task();
-    while !done(&t) {
-        let now = Instant::now();
-        if now >= limit {
-            break;
-        }
-        t = TASK_COND.wait_timeout(t, limit - now).unwrap().0;
-    }
-    done(&t)
-}
-
-fn run_posted() {
-    let (f, ctx, ep) = {
-        let mut t = task();
-        let f = t.pending_fn.take().unwrap();
-        INSIDE_TASK.store(true, Ordering::SeqCst);
-        (f, t.pending_ctx, t.pending_ep)
-    };
-    let rc = unsafe { f(ep.ptr(), ep.ptr(), 0, ctx.ptr()) };
-    if rc == MOQ_OK {
-        let mut t = task();
-        assert_eq!(t.added_tracks, t.expected_tracks);
-        t.pump_snapshots += 1;
-    }
-    INSIDE_TASK.store(false, Ordering::SeqCst);
-}
-
-unsafe extern "C" fn endpoint_post(
-    ep: *mut moq_endpoint_t,
-    f: moq_endpoint_task_fn,
-    ctx: *mut c_void,
-) -> moq_result_t {
-    let mut t = task();
-    if t.fail_post {
-        return MOQ_ERR_NOMEM;
-    }
-    t.pending_fn = f;
-    t.pending_ctx = Addr::of(ctx);
-    t.pending_ep = Addr::of(ep);
-    t.task_queued = true;
-    TASK_COND.notify_all();
-    if !t.hold_task {
-        *TASK_THREAD.lock().unwrap() = Some(
-            std::thread::Builder::new()
-                .name("mock-network".into())
-                .spawn(run_posted)
-                .unwrap(),
-        );
-    }
-    MOQ_OK // Scheduling success is independent of the task result.
-}
-
-unsafe extern "C" fn endpoint_connect(
-    _cfg: *const moq_endpoint_cfg_t,
-    out: *mut *mut moq_endpoint_t,
-) -> moq_result_t {
-    log_add(Op::Connect, None);
-    *out = handle(&FAKE_ENDPOINT);
-    MOQ_OK
-}
-
-unsafe extern "C" fn endpoint_stop(ep: *mut moq_endpoint_t) -> moq_result_t {
-    if let Some(th) = TASK_THREAD.lock().unwrap().take() {
-        th.join().unwrap();
-    }
-    let pending = {
-        let mut t = task();
-        t.pending_fn.take().map(|f| (f, t.pending_ctx))
-    };
-    if let Some((f, ctx)) = pending {
-        INSIDE_TASK.store(true, Ordering::SeqCst);
-        assert_eq!(
-            f(ep, std::ptr::null_mut(), 0, ctx.ptr()),
-            MOQ_ERR_INTERRUPTED
-        );
-        INSIDE_TASK.store(false, Ordering::SeqCst);
-        task().task_closed += 1;
-    }
-    MOQ_OK
-}
-
-unsafe extern "C" fn endpoint_destroy(_ep: *mut moq_endpoint_t) {}
-unsafe extern "C" fn endpoint_set_interrupted(_ep: *mut moq_endpoint_t, _v: bool) {}
-unsafe extern "C" fn endpoint_drain(_ep: *mut moq_endpoint_t, _us: u64) -> moq_result_t {
-    MOQ_OK
-}
-unsafe extern "C" fn endpoint_wait(_ep: *mut moq_endpoint_t, _us: u64) -> moq_result_t {
-    MOQ_OK
-}
-unsafe extern "C" fn endpoint_cfg_init(c: *mut moq_endpoint_cfg_t) {
-    zero_sized(c, |c, n| c.struct_size = n);
-}
-unsafe extern "C" fn track_cfg_init(c: *mut moq_media_track_cfg_t, n: usize) {
-    assert_eq!(n, std::mem::size_of::<moq_media_track_cfg_t>());
-    zero_sized(c, |c, n| c.struct_size = n);
-}
-unsafe extern "C" fn sender_cfg_init_live_sized(c: *mut moq_media_sender_cfg_t, n: usize) {
-    assert_eq!(n, std::mem::size_of::<moq_media_sender_cfg_t>());
-    zero_sized(c, |c, n| c.struct_size = n);
-}
-unsafe extern "C" fn sender_callbacks_init_sized(c: *mut moq_media_sender_callbacks_t, n: usize) {
-    assert_eq!(n, std::mem::size_of::<moq_media_sender_callbacks_t>());
-    zero_sized(c, |c, n| c.struct_size = n);
-}
-
-unsafe extern "C" fn sender_attach(
-    _ep: *mut moq_endpoint_t,
-    cfg: *const moq_media_sender_cfg_t,
-    out: *mut *mut moq_media_sender_t,
-) -> moq_result_t {
-    assert!(INSIDE_TASK.load(Ordering::SeqCst)); // Fails if attach escapes the managed turn.
-    log_add(Op::Attach, None);
-    // Capture the authored contentProtections for the cp cases.
-    let cfg = &*cfg;
-    let mut cps = ATTACHED_CPS.lock().unwrap();
-    cps.clear();
-    for i in 0..cfg.content_protection_count.min(8) {
-        let cp = &*cfg.content_protections.add(i);
-        let d = &cp.drm_system;
-        cps.push(Cp {
-            ref_id: span_dup(cp.ref_id),
-            scheme: span_dup(cp.scheme),
-            kid: (cp.default_kid_count > 0)
-                .then(|| span_dup(*cp.default_kids))
-                .flatten(),
-            system_id: span_dup(d.system_id),
-            la_url: d.la_url.present.then(|| span_dup(d.la_url.url)).flatten(),
-            pssh: d.has_pssh.then(|| span_dup(d.pssh)).flatten(),
-        });
-    }
-    drop(cps);
-    let fail = {
-        let mut t = task();
-        t.running_entered = true;
-        TASK_COND.notify_all();
-        while t.hold_running {
-            t = TASK_COND.wait(t).unwrap();
-        }
-        t.fail_attach
-    };
-    if fail {
-        return MOQ_ERR_NOMEM;
-    }
-    *out = handle(&FAKE_SENDER);
-    MOQ_OK
-}
-
-unsafe extern "C" fn sender_add_track(
-    _s: *mut moq_media_sender_t,
-    cfg: *const moq_media_track_cfg_t,
-    out: *mut *mut moq_media_track_t,
-) -> moq_result_t {
-    {
-        let mut t = task();
-        t.added_tracks += 1;
-        if t.fail_add == t.added_tracks {
-            return MOQ_ERR_NOMEM;
-        }
-    }
-    let cfg = &*cfg;
-    let name = span_dup(cfg.name).unwrap_or_default();
-    log_add(Op::AddTrack, Some(&name));
-
-    let refs: Vec<String> = (0..cfg.content_protection_ref_id_count)
-        .map(|i| span_dup(*cfg.content_protection_ref_ids.add(i)).unwrap_or_default())
-        .collect();
-    if let Some(m) = TRACK_REFS.lock().unwrap().as_mut() {
-        m.insert(name, refs.join(","));
-    }
-
-    *out = if cfg.media_type == MOQ_MEDIA_TYPE_AUDIO {
-        handle(&FAKE_TRACK_AUDIO)
-    } else {
-        handle(&FAKE_TRACK_VIDEO)
-    };
-    MOQ_OK
-}
-
-unsafe extern "C" fn sender_write(
-    _s: *mut moq_media_sender_t,
-    track: *mut moq_media_track_t,
-    obj: *const moq_media_send_object_t,
-) -> moq_result_t {
-    let obj = &*obj;
-    let audio = track == handle(&FAKE_TRACK_AUDIO);
-    {
-        let mut t = task();
-        if audio {
-            t.capture_audio = obj.capture_time_us;
-            if obj.starts_group {
-                t.audio_groups += 1;
-            }
-        } else {
-            t.capture_video = obj.capture_time_us;
-        }
-    }
-    moq_rcbuf_decref(obj.payload);
-    log_add(Op::Write, Some(if audio { "audio" } else { "video" }));
-    MOQ_OK
-}
-
-unsafe extern "C" fn sender_end_track(
-    _s: *mut moq_media_sender_t,
-    _t: *mut moq_media_track_t,
-) -> moq_result_t {
-    MOQ_OK
-}
-unsafe extern "C" fn sender_is_fatal(_s: *const moq_media_sender_t) -> bool {
-    false
-}
-unsafe extern "C" fn sender_fatal_code(_s: *const moq_media_sender_t) -> u64 {
-    0
-}
-unsafe extern "C" fn sender_get_stats(
-    _s: *const moq_media_sender_t,
-    out: *mut moq_media_sender_stats_t,
-    n: usize,
-) -> moq_result_t {
-    std::ptr::write_bytes(out as *mut u8, 0, n);
-    MOQ_OK
-}
-unsafe extern "C" fn sender_destroy(_s: *mut moq_media_sender_t) {}
-
-const API: Api = Api {
-    moq_endpoint_cfg_init: endpoint_cfg_init,
-    moq_endpoint_connect: endpoint_connect,
-    moq_endpoint_stop: endpoint_stop,
-    moq_endpoint_destroy: endpoint_destroy,
-    moq_endpoint_set_interrupted: endpoint_set_interrupted,
-    moq_endpoint_wait: endpoint_wait,
-    moq_endpoint_drain: endpoint_drain,
-    moq_endpoint_post: endpoint_post,
-    moq_media_sender_cfg_init_live_sized: sender_cfg_init_live_sized,
-    moq_media_sender_callbacks_init_sized: sender_callbacks_init_sized,
-    moq_media_sender_attach: sender_attach,
-    moq_media_sender_destroy: sender_destroy,
-    moq_media_track_cfg_init_sized: track_cfg_init,
-    moq_media_sender_add_track: sender_add_track,
-    moq_media_sender_write: sender_write,
-    moq_media_sender_end_track: sender_end_track,
-    moq_media_sender_is_fatal: sender_is_fatal,
-    moq_media_sender_fatal_code: sender_fatal_code,
-    moq_media_sender_get_stats: sender_get_stats,
-    ..REAL
+use crate::service::fake::{
+    control, log_add, log_count, log_find, release_attach, suite as fake_suite, wait_attach_entered,
+    Op, Suite as FakeSuite,
 };
+use moq5::sys::{
+    moq_cmaf_fragment_info_init, moq_cmaf_init_info_init, moq_cmaf_init_info_t,
+    moq_cmaf_parse_fragment, moq_cmaf_parse_init, moq_cmaf_sample_t, moq_cmaf_fragment_info_t,
+    MOQ_OK,
+};
+use crate::test_support::{bytes, span};
 
 // -- fixture -------------------------------------------------------------------
 
-struct Suite {
-    _api: ApiGuard,
-    _serial: MutexGuard<'static, ()>,
-}
+type Suite = FakeSuite;
 
 fn suite() -> Suite {
-    let serial = serial();
-    *task() = Task::NEW;
-    log_reset();
-    capture_reset();
-    Suite {
-        _api: install(API),
-        _serial: serial,
-    }
+    fake_suite()
 }
+
+/// The refIDs the element declared on the track called `name`, comma joined.
+fn track_refs(name: &str) -> Option<String> {
+    control()
+        .added_cfgs
+        .iter()
+        .find(|cfg| cfg.name == name)
+        .map(|cfg| cfg.cp_ref_ids.join(","))
+}
+
+/// Poll until `done` holds or a second passes.
+fn wait_until(done: impl Fn() -> bool) -> bool {
+    let limit = Instant::now() + Duration::from_secs(1);
+    while !done() {
+        if Instant::now() >= limit {
+            return false;
+        }
+        std::thread::yield_now();
+    }
+    true
+}
+
+/// Set once the element logs that it is parked in the barrier.
+static BARRIER_WAITING: AtomicBool = AtomicBool::new(false);
 
 /// avcC: version 1, profile 0x42, compat 0xc0, level 0x1e. prepare_loc_track's
 /// stream-format=avc path needs only these four bytes to be well-formed.
@@ -575,7 +205,6 @@ fn ms(v: u64) -> gst::ClockTime {
 #[test]
 fn initial_catalog_complete() {
     let _suite = suite();
-    task().expected_tracks = 2;
     let sink = new_sink();
 
     // PAUSED first: the element activates its sink pads on READY->PAUSED, and
@@ -633,7 +262,6 @@ fn initial_catalog_complete() {
 #[test]
 fn unlinked_pad_excluded() {
     let _suite = suite();
-    task().expected_tracks = 1;
     let sink = new_sink();
 
     assert!(sink.set_state(gst::State::Paused).is_ok());
@@ -700,13 +328,13 @@ fn empty_eos() {
 
 fn flush_cancels(state_change: bool) {
     let _suite = suite();
+    BARRIER_WAITING.store(false, Ordering::SeqCst);
     let observe = gst::log::add_log_function(|_cat, _level, _file, _fn, _line, _obj, msg| {
         if msg
             .get()
             .is_some_and(|m| m.as_str() == "waiting for linked track set")
         {
-            task().barrier_waiting = true;
-            TASK_COND.notify_all();
+            BARRIER_WAITING.store(true, Ordering::SeqCst);
         }
     });
     let cat = *super::imp::CAT;
@@ -719,7 +347,7 @@ fn flush_cancels(state_change: bool) {
     let asrc = open_src_pad(&sink, "audio", "a", audio_caps());
     let vsrc = open_src_pad(&sink, "video", "v", video_caps());
     let (job, th) = PushJob::start(&asrc, keyframe(gst::ClockTime::ZERO, 64));
-    assert!(wait_task_until(|t| t.barrier_waiting));
+    assert!(wait_until(|| BARRIER_WAITING.load(Ordering::SeqCst)));
     if state_change {
         assert!(sink.set_state(gst::State::Ready).is_ok());
     } else {
@@ -745,67 +373,49 @@ fn state_cancels_barrier() {
     flush_cancels(true);
 }
 
-/// mode 0: the startup task stays queued and a flush cancels it;
-/// 1: post rejected; 2: attach failed; 3: add_track failed.
-fn start_failure(mode: u32) {
+/// A startup that fails at the service: `attach` refused, or the first
+/// `add_track` refused. Either way no media may be written.
+///
+/// The old suite had two more modes, for libmoq's posted startup task:
+/// `queued_start_cancel` (flush a task still queued) and `post_rejected`
+/// (`moq_endpoint_post` refusing). The moq5 crate no longer exposes
+/// `moq_endpoint_post`, so the element attaches and adds its tracks directly
+/// and neither case exists; cancelling while the barrier waits is covered by
+/// `flush_cancels_barrier`, and cancelling mid-attach by
+/// `running_start_cancel`.
+fn start_failure(attach: bool) {
     let _suite = suite();
     {
-        let mut t = task();
-        t.expected_tracks = 1;
-        t.hold_task = mode == 0;
-        t.fail_post = mode == 1;
-        t.fail_attach = mode == 2;
-        t.fail_add = if mode == 3 { 1 } else { 0 };
+        let mut c = control();
+        c.fail_attach = attach;
+        c.fail_add = if attach { 0 } else { 1 };
     }
     let sink = new_sink();
     let _ = sink.set_state(gst::State::Paused);
     let src = open_src_pad(&sink, "video", "v", video_caps());
-    if mode == 0 {
-        let (job, th) = PushJob::start(&src, keyframe(gst::ClockTime::ZERO, 64));
-        assert!(wait_task_until(|t| t.task_queued));
-        assert!(src.push_event(gst::event::FlushStart::new()));
-        job.join(th, Err(gst::FlowError::Flushing));
-        assert_eq!(task().task_closed, 1);
-        assert_eq!(log_count(Op::Attach), 0);
-    } else {
-        assert_eq!(
-            src.push(keyframe(gst::ClockTime::ZERO, 64)),
-            Err(gst::FlowError::Error)
-        );
-    }
+    assert_eq!(
+        src.push(keyframe(gst::ClockTime::ZERO, 64)),
+        Err(gst::FlowError::Error)
+    );
     assert_eq!(log_count(Op::Write), 0);
     let _ = sink.set_state(gst::State::Null);
     close_source(src);
 }
 
 #[test]
-fn queued_start_cancel() {
-    start_failure(0);
-}
-
-#[test]
-fn post_rejected() {
-    start_failure(1);
-}
-
-#[test]
 fn attach_failed() {
-    start_failure(2);
+    start_failure(true);
 }
 
 #[test]
 fn add_failed() {
-    start_failure(3);
+    start_failure(false);
 }
 
 #[test]
 fn partial_add_failed() {
     let _suite = suite();
-    {
-        let mut t = task();
-        t.expected_tracks = 2;
-        t.fail_add = 2;
-    }
+    control().fail_add = 2;
     let sink = new_sink();
     let _ = sink.set_state(gst::State::Paused);
     let asrc = open_src_pad(&sink, "audio", "a", audio_caps());
@@ -816,7 +426,7 @@ fn partial_add_failed() {
         Err(gst::FlowError::Error)
     );
     job.join(th, Err(gst::FlowError::Error));
-    assert_eq!(task().added_tracks, 2);
+    assert_eq!(control().added_tracks, 2);
     assert_eq!(log_count(Op::Write), 0);
     let _ = sink.set_state(gst::State::Null);
     close_source(asrc);
@@ -826,16 +436,12 @@ fn partial_add_failed() {
 #[test]
 fn running_start_cancel() {
     let _suite = suite();
-    {
-        let mut t = task();
-        t.expected_tracks = 1;
-        t.hold_running = true;
-    }
+    control().hold_attach = true;
     let sink = new_sink();
     let _ = sink.set_state(gst::State::Paused);
     let src = open_src_pad(&sink, "video", "v", video_caps());
     let (job, th) = PushJob::start(&src, keyframe(gst::ClockTime::ZERO, 64));
-    assert!(wait_task_until(|t| t.running_entered));
+    wait_attach_entered();
     let sinkpad = sink.static_pad("video").unwrap();
     // The pad's public flushing flag is set by FLUSH_START before the handler
     // runs; release the held attach only once it is.
@@ -845,8 +451,7 @@ fn running_start_cancel() {
             std::thread::yield_now();
         }
         assert!(sinkpad.pad_flags().contains(gst::PadFlags::FLUSHING));
-        task().hold_running = false;
-        TASK_COND.notify_all();
+        release_attach();
     });
     assert!(src.push_event(gst::event::FlushStart::new()));
     release.join().unwrap();
@@ -909,7 +514,6 @@ fn push_segment(src: &gst::Pad, offset: gst::ClockTime) {
 #[test]
 fn capture_and_groups() {
     let _suite = suite();
-    task().expected_tracks = 2;
     let sink = new_sink();
     let _ = sink.set_state(gst::State::Paused);
     let asrc = open_src_pad(&sink, "audio", "a", audio_caps());
@@ -921,18 +525,18 @@ fn capture_and_groups() {
     assert_eq!(vsrc.push(keyframe(offset, 64)), OK);
     job.join(th, OK);
     {
-        let t = task();
-        assert_eq!(t.capture_video, t.capture_audio);
+        let c = control();
+        assert_eq!(c.capture_video, c.capture_audio);
     }
-    let before = task().audio_groups;
+    let before = control().audio_groups;
     assert_eq!(asrc.push(keyframe(ms(20), 64)), OK);
-    let after = task().audio_groups;
+    let after = control().audio_groups;
     assert_eq!(asrc.push(keyframe(ms(40), 64)), OK);
-    assert_eq!(task().audio_groups, after); // no group for every AAC AU
+    assert_eq!(control().audio_groups, after); // no group for every AAC AU
     assert!(after <= before + 1);
     assert_eq!(vsrc.push(keyframe(offset + ms(100), 64)), OK);
     assert_eq!(asrc.push(keyframe(ms(120), 64)), OK);
-    assert_eq!(task().audio_groups, after + 1);
+    assert_eq!(control().audio_groups, after + 1);
     let _ = sink.set_state(gst::State::Null);
     close_source(asrc);
     close_source(vsrc);
@@ -1098,14 +702,6 @@ fn push_cmaf_init(sink: &MoqSink, protected: bool, scheme: &[u8; 4]) {
         assert_eq!(&unsafe { bytes(probe.scheme) }[..4], scheme);
     }
 
-    // One video pad, so one track reaches the startup task; run_posted asserts
-    // this count.
-    {
-        let mut t = task();
-        t.added_tracks = 0;
-        t.expected_tracks = 1;
-    }
-
     assert!(sink.set_state(gst::State::Paused).is_ok());
 
     // A video_%u request pad defaults its track-name to "video".
@@ -1144,8 +740,9 @@ fn push_cmaf_init(sink: &MoqSink, protected: bool, scheme: &[u8; 4]) {
     let _ = src.set_active(false);
 }
 
-fn cps() -> Vec<Cp> {
-    ATTACHED_CPS.lock().unwrap().clone()
+/// The contentProtections the element authored on the sender.
+fn cps() -> Vec<moq5::ContentProtection> {
+    control().attached_cps.clone()
 }
 
 /// The scheme and KID are never configured -- they come from the init
@@ -1164,14 +761,17 @@ fn cp_authored_from_init() {
 
     let cps = cps();
     assert_eq!(cps.len(), 1);
-    assert_eq!(cps[0].ref_id.as_deref(), Some("cp0"));
+    assert_eq!(cps[0].ref_id, "cp0");
     // Derived from the tenc default_KID: raw 16 bytes -> CMSF UUID string.
-    assert_eq!(cps[0].kid.as_deref(), Some(FIXTURE_KID_UUID));
-    assert_eq!(cps[0].scheme.as_deref(), Some("cenc"));
-    assert_eq!(cps[0].system_id.as_deref(), Some(WIDEVINE_UUID));
-    assert_eq!(cps[0].la_url.as_deref(), Some("https://lic.example/wv"));
+    assert_eq!(cps[0].default_kids, [FIXTURE_KID_UUID]);
+    assert_eq!(cps[0].scheme, "cenc");
+    assert_eq!(cps[0].drm_system.system_id, WIDEVINE_UUID);
+    assert_eq!(
+        cps[0].drm_system.la_url.as_ref().map(|u| u.url.as_str()),
+        Some("https://lic.example/wv")
+    );
     // The '=' padding of a base64 PSSH must survive the key=value split.
-    assert_eq!(cps[0].pssh.as_deref(), Some("AAAAQ3Bzc2g="));
+    assert_eq!(cps[0].drm_system.pssh.as_deref(), Some("AAAAQ3Bzc2g="));
 
     assert_eq!(track_refs("video").as_deref(), Some("cp0"));
 }
@@ -1193,15 +793,15 @@ fn cp_two_systems_one_key() {
 
     let cps = cps();
     assert_eq!(cps.len(), 2);
-    assert_eq!(cps[0].ref_id.as_deref(), Some("cp0"));
-    assert_eq!(cps[1].ref_id.as_deref(), Some("cp1"));
-    assert_eq!(cps[0].system_id.as_deref(), Some(WIDEVINE_UUID));
-    assert_eq!(cps[1].system_id.as_deref(), Some(PLAYREADY_UUID));
+    assert_eq!(cps[0].ref_id, "cp0");
+    assert_eq!(cps[1].ref_id, "cp1");
+    assert_eq!(cps[0].drm_system.system_id, WIDEVINE_UUID);
+    assert_eq!(cps[1].drm_system.system_id, PLAYREADY_UUID);
     // One key, carried by both, and the scheme comes from schm, not config.
-    assert_eq!(cps[0].kid.as_deref(), Some(FIXTURE_KID_UUID));
-    assert_eq!(cps[1].kid.as_deref(), Some(FIXTURE_KID_UUID));
-    assert_eq!(cps[0].scheme.as_deref(), Some("cbcs"));
-    assert_eq!(cps[1].scheme.as_deref(), Some("cbcs"));
+    assert_eq!(cps[0].default_kids, [FIXTURE_KID_UUID]);
+    assert_eq!(cps[1].default_kids, [FIXTURE_KID_UUID]);
+    assert_eq!(cps[0].scheme, "cbcs");
+    assert_eq!(cps[1].scheme, "cbcs");
 
     assert_eq!(track_refs("video").as_deref(), Some("cp0,cp1"));
 }

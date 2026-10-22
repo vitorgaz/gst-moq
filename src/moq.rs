@@ -1,6 +1,6 @@
 //! What both elements share on top of the moq5 crate.
 
-use moq5::{EndpointConfig, Protocol, Version, VersionOffer};
+use crate::service::EndpointCfg;
 
 /// The `https://host:port/path` URL both elements dial.
 pub fn relay_url(host: &str, port: u32, relay_path: &str) -> String {
@@ -8,14 +8,13 @@ pub fn relay_url(host: &str, port: u32, relay_path: &str) -> String {
 }
 
 /// A WebTransport endpoint config for `url`, pinned to `draft` unless it is 0.
-pub fn endpoint_config(url: &str, insecure: bool, draft: u32) -> EndpointConfig {
-    let cfg = EndpointConfig::new(url)
-        .protocol(Protocol::WebTransport)
-        .insecure_skip_verify(insecure);
-    if draft == 0 {
-        cfg
-    } else {
-        cfg.versions(VersionOffer::Exact(Version::from_draft(draft)))
+/// The transport choice lives in the service adapter, which replays this onto
+/// libmoq's own builder.
+pub(crate) fn endpoint_config(url: &str, insecure: bool, draft: u32) -> EndpointCfg {
+    EndpointCfg {
+        url: url.to_owned(),
+        insecure,
+        draft,
     }
 }
 

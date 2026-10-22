@@ -70,8 +70,13 @@ MOQ5 repository):
 - unit tests for the fMP4 splitter and the codec strings;
 - the element suites (`moqsink` track barrier and content protection,
   `moqsink` EOS/flush recovery, `moqsrc` delivery), which drive the real
-  element code with the libmoq service calls replaced by mocks (installed
-  through `moq5`'s `testing` feature);
+  element code against a test double for the service (`src/service/fake.rs`).
+  Both elements reach libmoq through `src/service`, a small boundary over the
+  `moq5` crate: a release build compiles `service::real`, which forwards each
+  call inline, and a test build compiles the double, which records what the
+  element asked for. Picking the implementation at compile time keeps the
+  release path free of dynamic dispatch, and leaves the double unable to
+  notice libmoq itself changing -- that is what the e2e suite is for;
 - `tests/smoke.sh` against a freshly built plugin (inspection, a CMAF publish
   pipeline against a refused relay, a `moqsink` state cycle), plus its
   socket-free guard tests in `tests/test_smoke_guards.py`.

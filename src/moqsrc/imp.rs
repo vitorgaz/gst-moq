@@ -41,10 +41,9 @@ use std::sync::{LazyLock, Mutex, MutexGuard};
 use std::time::Duration;
 
 use moq5::sys::{MOQ_DONE, MOQ_ERR_CLOSED, MOQ_ERR_INTERRUPTED, MOQ_OK};
-use moq5::{
-    Endpoint, Error, MediaReceiver, Namespace, Packaging, ReceiverConfig, ReceiverTrack,
-    TerminalReason, TrackDesc, TrackEventKind,
-};
+use moq5::{Error, Namespace, Packaging, TerminalReason, TrackEventKind};
+
+use crate::service::{Desc, Endpoint, Receiver, ReceiverCfg, Track};
 
 use crate::clock;
 use crate::moq::{endpoint_config, relay_url};
@@ -99,9 +98,9 @@ impl Default for Settings {
 #[derive(Default)]
 pub(crate) struct State {
     /// holds the endpoint too, so it is destroyed before the endpoint stops
-    pub(crate) receiver: Option<MediaReceiver>,
+    pub(crate) receiver: Option<Receiver>,
     /// handle matching track-name, if any
-    pub(crate) want_track: Option<ReceiverTrack>,
+    pub(crate) want_track: Option<Track>,
     pub(crate) want_track_ended: bool,
     pub(crate) selection_failed: bool,
     pub(crate) started: bool,
@@ -226,14 +225,14 @@ impl MoqSrc {
         while let Ok(Some(ev)) = receiver.poll_track() {
             match ev.kind() {
                 TrackEventKind::Added => {
-                    let d = ev.desc();
+                    let d = ev.description().ok().flatten();
                     gst::info!(
                         CAT,
                         imp = self,
                         "TRACK_ADDED name={} codec={} packaging={}",
-                        d.map(|d| lossy(d.name())).unwrap_or_default(),
-                        d.map(|d| lossy(d.codec())).unwrap_or_default(),
-                        if d.is_some_and(|d| d.packaging() == Some(Packaging::Cmaf)) {
+                        d.as_ref().map(|d| lossy(d.name())).unwrap_or_default(),
+                        d.as_ref().map(|d| lossy(d.codec())).unwrap_or_default(),
+                        if d.as_ref().is_some_and(|d| d.packaging() == Some(Packaging::Cmaf)) {
                             "cmaf"
                         } else {
                             "loc"
@@ -248,7 +247,7 @@ impl MoqSrc {
                             seen.push_str(&lossy(d.name()));
                         }
                     }
-                    if d.raw().name.data.is_null()
+                    if !d.has_name()
                         || st.want_track.is_some()
                         || d.name() != track_name.as_bytes()
                     {
@@ -278,17 +277,14 @@ impl MoqSrc {
                         CAT,
                         imp = self,
                         "selected endpoint negotiated draft={}",
-                        receiver
-                            .endpoint()
-                            .negotiated_version()
-                            .map_or(0, |v| v.draft())
+                        receiver.negotiated_draft()
                     );
                     st.want_track = Some(track);
                     st.want_track_ended = false;
                     st.track_ever_seen = true;
                     st.want_init = d.init_data().to_vec();
                     st.init_pushed = false;
-                    if d.packaging() == Some(Packaging::Loc) && d.codec().starts_with(b"mp4a") {
+                    if d.packaging() == Some(Packaging::Raw) && d.codec().starts_with(b"mp4a") {
                         st.want_init.clear();
                     }
                     if caps.as_ref().is_none_or(|c| c.is_any()) {
@@ -336,7 +332,7 @@ impl MoqSrc {
                             CAT,
                             imp = self,
                             "selected-track terminal event kind={} name={}",
-                            ev.raw().kind,
+                            ev.raw_kind(),
                             track_name
                         );
                         // Handles and descriptors remain stable until receiver
@@ -356,7 +352,7 @@ impl MoqSrc {
     /// LOC audio: raw AAC access units. The decoder config travels in the
     /// catalog, so it becomes codec_data rather than a pushed init segment --
     /// unlike CMAF, where qtdemux reads it from the moov.
-    fn loc_aac_caps(d: TrackDesc<'_>) -> gst::Caps {
+    fn loc_aac_caps(d: Desc<'_>) -> gst::Caps {
         let mut b = gst::Caps::builder("audio/mpeg")
             .field("mpegversion", 4i32)
             .field("stream-format", "raw");
@@ -381,7 +377,7 @@ impl MoqSrc {
         }
         // Prefer the parsed decoder extradata; fall back to the raw initData
         // the publisher sent (they are the same ASC here).
-        let config = d.init_info().codec_config();
+        let config = d.codec_config();
         let asc = if config.is_empty() {
             d.init_data()
         } else {
@@ -587,7 +583,7 @@ impl MoqSrc {
                 return Err(gst::FlowError::Eos);
             }
 
-            // Nothing queued. Wait for the next wakeup.
+            // Nothing queued. WaitResult for the next wakeup.
             if receiver.wait(Duration::from_micros(WAIT_TIMEOUT_US)) == Err(Error::INTERRUPTED) {
                 return Err(gst::FlowError::Flushing);
             }
@@ -806,8 +802,8 @@ impl BaseSrcImpl for MoqSrc {
 
         // Attach, not create: we own the endpoint above. Tracks are selected
         // by name, so nothing is auto-subscribed.
-        let cfg = ReceiverConfig::live(namespace).auto_subscribe(false);
-        let receiver = match MediaReceiver::attach(&ep, cfg) {
+        let cfg = ReceiverCfg::live(namespace).auto_subscribe(false);
+        let receiver = match Receiver::attach(&ep, &cfg) {
             Ok(r) => r,
             Err(e) => {
                 self.log_terminal(&ep);

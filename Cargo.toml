@@ -25,11 +25,11 @@ path = "src/bin/inspect_cmaf_fixture.rs"
 gst = { package = "gstreamer", version = "0.25", features = ["v1_22"] }
 gst-base = { package = "gstreamer-base", version = "0.25", features = ["v1_22"] }
 # The Rust bindings live in moq5 (bindings/rust); pinned to a commit.
-moq5 = { git = "https://github.com/vitorgaz/moq5", rev = "20f6d9c885830d1cb6c44e186b797518c2cdf7db" }
+moq5 = { git = "https://github.com/openmoq/moq5", rev = "2a305fc7158c47501391d6f59774b157e215df13" }
 
 [dev-dependencies]
 # The fake-libmoq seam the unit tests install.
-moq5 = { git = "https://github.com/vitorgaz/moq5", rev = "20f6d9c885830d1cb6c44e186b797518c2cdf7db", features = ["testing"] }
+moq5 = { git = "https://github.com/openmoq/moq5", rev = "2a305fc7158c47501391d6f59774b157e215df13"  }
 
 [profile.release]
 lto = "thin"

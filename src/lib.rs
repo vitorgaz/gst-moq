@@ -11,6 +11,8 @@ pub mod fmp4;
 pub mod moq;
 pub mod moqsink;
 pub mod moqsrc;
+mod service;
+mod payload;
 
 #[cfg(test)]
 mod test_support;

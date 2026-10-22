@@ -1,4 +1,4 @@
-//! Sink EOS / flush / restart recovery against public-service mocks.
+//! Sink EOS / flush / restart recovery against the service double.
 //!
 //! Port of tests/test_sink_recovery.c. Like the C suite, it drives the real
 //! element internals and replaces the libmoq service calls and the clock: the
@@ -8,285 +8,24 @@
 use gst::prelude::*;
 use gst::subclass::prelude::*;
 
-use std::ffi::c_void;
-use std::sync::atomic::{AtomicI64, AtomicU8, Ordering};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::Mutex;
 
 use super::imp::EOS_DRAIN_TIMEOUT_US;
 use super::{MoqSink, MoqSinkPad};
-use crate::test_support::{serial, zero_sized, Addr};
-use moq5::sys::*;
-use moq5::testing::{install, Api, ApiGuard, REAL};
-use moq5::{MediaType, Packaging, RcBuf, SendObject, TrackConfig};
+use crate::service::fake::{control, suite as fake_suite, Suite as FakeSuite};
+use crate::service::TrackCfg;
+use moq5::{Buffer, Error, MediaType, Packaging, SendObject, WaitResult};
 
 const USEC_PER_SEC: i64 = 1_000_000;
 
 static NOW: AtomicI64 = AtomicI64::new(0);
-static EP_ID: AtomicU8 = AtomicU8::new(0);
-static SENDER_ID: AtomicU8 = AtomicU8::new(0);
-static TRACK_IDS: [AtomicU8; 16] = [const { AtomicU8::new(0) }; 16];
-
-fn track_id(i: usize) -> *mut moq_media_track_t {
-    &TRACK_IDS[i] as *const AtomicU8 as *mut moq_media_track_t
-}
-
-struct Mock {
-    tracks: usize,
-    writes: u32,
-    ends: u32,
-    drains: u32,
-    connects: u32,
-    destroys: u32,
-    refusals: u32,
-    interrupted: bool,
-    ended: [bool; 16],
-    cancel_drain: bool,
-    drain_result: moq_result_t,
-    budget: u64,
-    ready_ctx: Addr,
-    ready_fn: Option<unsafe extern "C" fn(*mut c_void, *mut moq_media_sender_t)>,
-    ready_during_attach: bool,
-    ready_during_destroy: bool,
-    ready_logs: u32,
-}
-
-impl Mock {
-    const NEW: Mock = Mock {
-        tracks: 0,
-        writes: 0,
-        ends: 0,
-        drains: 0,
-        connects: 0,
-        destroys: 0,
-        refusals: 0,
-        interrupted: false,
-        ended: [false; 16],
-        cancel_drain: false,
-        drain_result: MOQ_OK,
-        budget: 0,
-        ready_ctx: Addr(0),
-        ready_fn: None,
-        ready_during_attach: false,
-        ready_during_destroy: false,
-        ready_logs: 0,
-    };
-}
-
-static MOCK: Mutex<Mock> = Mutex::new(Mock::NEW);
 static ACTIVE: Mutex<Option<MoqSink>> = Mutex::new(None);
 static CONTINUING: Mutex<Option<MoqSinkPad>> = Mutex::new(None);
-static CANCELLER: Mutex<Option<MoqSinkPad>> = Mutex::new(None);
-
-fn mock() -> MutexGuard<'static, Mock> {
-    MOCK.lock().unwrap_or_else(|e| e.into_inner())
-}
 
 fn active() -> MoqSink {
     ACTIVE.lock().unwrap().clone().expect("active sink")
 }
-
-// -- libmoq service mocks ----------------------------------------------------
-
-unsafe extern "C" fn endpoint_cfg_init(c: *mut moq_endpoint_cfg_t) {
-    zero_sized(c, |c, n| c.struct_size = n);
-}
-unsafe extern "C" fn endpoint_connect(
-    _c: *const moq_endpoint_cfg_t,
-    out: *mut *mut moq_endpoint_t,
-) -> moq_result_t {
-    let mut m = mock();
-    m.connects += 1;
-    m.interrupted = false;
-    *out = &EP_ID as *const AtomicU8 as *mut moq_endpoint_t;
-    MOQ_OK
-}
-unsafe extern "C" fn endpoint_stop(_ep: *mut moq_endpoint_t) -> moq_result_t {
-    MOQ_OK
-}
-unsafe extern "C" fn endpoint_post(
-    ep: *mut moq_endpoint_t,
-    f: moq_endpoint_task_fn,
-    ctx: *mut c_void,
-) -> moq_result_t {
-    let _ = f.unwrap()(ep, ep as *mut moq_session_t, 0, ctx);
-    MOQ_OK
-}
-unsafe extern "C" fn endpoint_destroy(_ep: *mut moq_endpoint_t) {
-    mock().destroys += 1;
-}
-unsafe extern "C" fn endpoint_set_interrupted(_ep: *mut moq_endpoint_t, v: bool) {
-    mock().interrupted = v;
-}
-unsafe extern "C" fn endpoint_wait(_ep: *mut moq_endpoint_t, _us: u64) -> moq_result_t {
-    NOW.fetch_add(USEC_PER_SEC, Ordering::SeqCst);
-    if mock().interrupted {
-        MOQ_ERR_INTERRUPTED
-    } else {
-        MOQ_OK
-    }
-}
-unsafe extern "C" fn endpoint_drain(_ep: *mut moq_endpoint_t, us: u64) -> moq_result_t {
-    let cancel = {
-        let mut m = mock();
-        m.drains += 1;
-        m.budget = us;
-        m.cancel_drain
-    };
-    if cancel {
-        let canceller = CANCELLER.lock().unwrap().clone().unwrap();
-        active().imp().set_pad_flush(&canceller, true);
-    }
-    let m = mock();
-    if m.interrupted {
-        MOQ_ERR_INTERRUPTED
-    } else {
-        m.drain_result
-    }
-}
-unsafe extern "C" fn sender_cfg_init_live_sized(c: *mut moq_media_sender_cfg_t, size: usize) {
-    assert_eq!(size, std::mem::size_of::<moq_media_sender_cfg_t>());
-    zero_sized(c, |c, n| c.struct_size = n);
-}
-unsafe extern "C" fn sender_callbacks_init_sized(
-    c: *mut moq_media_sender_callbacks_t,
-    size: usize,
-) {
-    assert_eq!(size, std::mem::size_of::<moq_media_sender_callbacks_t>());
-    zero_sized(c, |c, n| c.struct_size = n);
-}
-unsafe extern "C" fn sender_attach(
-    _ep: *mut moq_endpoint_t,
-    c: *const moq_media_sender_cfg_t,
-    out: *mut *mut moq_media_sender_t,
-) -> moq_result_t {
-    let c = &*c;
-    assert_eq!(
-        c.struct_size as usize,
-        std::mem::size_of::<moq_media_sender_cfg_t>()
-    );
-    assert_eq!(
-        c.callbacks.struct_size as usize,
-        std::mem::size_of::<moq_media_sender_callbacks_t>()
-    );
-    assert!(c.callbacks.on_ready.is_some());
-    let early = {
-        let mut m = mock();
-        m.ready_ctx = Addr::of(c.callbacks.ctx);
-        m.ready_fn = c.callbacks.on_ready;
-        m.ready_during_attach
-    };
-    let sender = &SENDER_ID as *const AtomicU8 as *mut moq_media_sender_t;
-    if early {
-        assert!(active().imp().send_lock().sender.is_none());
-        c.callbacks.on_ready.unwrap()(c.callbacks.ctx, sender);
-    }
-    *out = sender;
-    MOQ_OK
-}
-unsafe extern "C" fn sender_destroy(s: *mut moq_media_sender_t) {
-    let (during, ctx, f) = {
-        let m = mock();
-        (m.ready_during_destroy, m.ready_ctx, m.ready_fn)
-    };
-    if during {
-        f.unwrap()(ctx.ptr(), s);
-    }
-}
-unsafe extern "C" fn track_cfg_init(c: *mut moq_media_track_cfg_t, n: usize) {
-    assert_eq!(n, std::mem::size_of::<moq_media_track_cfg_t>());
-    zero_sized(c, |c, n| c.struct_size = n);
-}
-unsafe extern "C" fn sender_add_track(
-    _s: *mut moq_media_sender_t,
-    _c: *const moq_media_track_cfg_t,
-    out: *mut *mut moq_media_track_t,
-) -> moq_result_t {
-    let mut m = mock();
-    assert!(m.tracks < 16);
-    *out = track_id(m.tracks);
-    m.tracks += 1;
-    MOQ_OK
-}
-unsafe extern "C" fn sender_end_track(
-    _s: *mut moq_media_sender_t,
-    t: *mut moq_media_track_t,
-) -> moq_result_t {
-    let mut m = mock();
-    m.ends += 1;
-    if m.interrupted {
-        return MOQ_ERR_INTERRUPTED;
-    }
-    if m.refusals > 0 {
-        m.refusals -= 1;
-        return MOQ_ERR_WOULD_BLOCK;
-    }
-    for i in 0..m.tracks {
-        if t == track_id(i) {
-            m.ended[i] = true;
-            return MOQ_OK;
-        }
-    }
-    MOQ_ERR_INVAL
-}
-unsafe extern "C" fn sender_write(
-    _s: *mut moq_media_sender_t,
-    t: *mut moq_media_track_t,
-    o: *const moq_media_send_object_t,
-) -> moq_result_t {
-    let mut m = mock();
-    if m.interrupted {
-        return MOQ_ERR_INTERRUPTED;
-    }
-    for i in 0..m.tracks {
-        if t == track_id(i) {
-            if m.ended[i] {
-                return MOQ_ERR_WRONG_STATE;
-            }
-            m.writes += 1;
-            moq_rcbuf_decref((*o).payload);
-            return MOQ_OK;
-        }
-    }
-    MOQ_ERR_INVAL
-}
-unsafe extern "C" fn sender_get_stats(
-    _s: *const moq_media_sender_t,
-    out: *mut moq_media_sender_stats_t,
-    n: usize,
-) -> moq_result_t {
-    assert_eq!(n, std::mem::size_of::<moq_media_sender_stats_t>());
-    zero_sized(out, |o, n| o.struct_size = n);
-    MOQ_OK
-}
-unsafe extern "C" fn sender_is_fatal(_s: *const moq_media_sender_t) -> bool {
-    false
-}
-unsafe extern "C" fn sender_fatal_code(_s: *const moq_media_sender_t) -> u64 {
-    0
-}
-
-const API: Api = Api {
-    moq_endpoint_cfg_init: endpoint_cfg_init,
-    moq_endpoint_connect: endpoint_connect,
-    moq_endpoint_stop: endpoint_stop,
-    moq_endpoint_destroy: endpoint_destroy,
-    moq_endpoint_set_interrupted: endpoint_set_interrupted,
-    moq_endpoint_wait: endpoint_wait,
-    moq_endpoint_drain: endpoint_drain,
-    moq_endpoint_post: endpoint_post,
-    moq_media_sender_cfg_init_live_sized: sender_cfg_init_live_sized,
-    moq_media_sender_callbacks_init_sized: sender_callbacks_init_sized,
-    moq_media_sender_attach: sender_attach,
-    moq_media_sender_destroy: sender_destroy,
-    moq_media_track_cfg_init_sized: track_cfg_init,
-    moq_media_sender_add_track: sender_add_track,
-    moq_media_sender_write: sender_write,
-    moq_media_sender_end_track: sender_end_track,
-    moq_media_sender_is_fatal: sender_is_fatal,
-    moq_media_sender_fatal_code: sender_fatal_code,
-    moq_media_sender_get_stats: sender_get_stats,
-    ..REAL
-};
 
 // -- clock: time only moves when the element waits or retries ----------------
 
@@ -295,7 +34,7 @@ fn now() -> i64 {
 }
 
 fn write_other(p: &MoqSinkPad) {
-    let payload = RcBuf::copy_from_slice(&[42]).unwrap();
+    let payload = Buffer::copy_from(&[42]).unwrap();
     assert_eq!(
         active().imp().write_object(p, SendObject::new(payload), 1),
         Ok(gst::FlowSuccess::Ok)
@@ -316,54 +55,33 @@ fn pause_retry(us: u64) {
 // -- fixture -----------------------------------------------------------------
 
 struct Suite {
-    _api: ApiGuard,
+    _fake: FakeSuite,
     _clock: crate::clock::ClockGuard,
-    _serial: MutexGuard<'static, ()>,
 }
 
 impl Drop for Suite {
     fn drop(&mut self) {
         *ACTIVE.lock().unwrap() = None;
         *CONTINUING.lock().unwrap() = None;
-        *CANCELLER.lock().unwrap() = None;
-        *mock() = Mock::NEW;
     }
 }
 
 fn suite() -> Suite {
-    let serial = serial();
-    *mock() = Mock::NEW;
+    // fake_suite takes the shared serial lock and resets the control block.
+    let fake = fake_suite();
+    // Waiting on the endpoint is what advances this suite's clock.
+    control().on_wait = Some(Box::new(|| {
+        NOW.fetch_add(USEC_PER_SEC, Ordering::SeqCst);
+    }));
     Suite {
-        _api: install(API),
+        _fake: fake,
         _clock: crate::clock::install(now, pause_retry),
-        _serial: serial,
     }
 }
 
 fn make_sink() -> MoqSink {
-    {
-        let mut m = mock();
-        let (ready_ctx, ready_fn, during_attach, during_destroy, logs, interrupted) = (
-            m.ready_ctx,
-            m.ready_fn,
-            m.ready_during_attach,
-            m.ready_during_destroy,
-            m.ready_logs,
-            m.interrupted,
-        );
-        *m = Mock {
-            ready_ctx,
-            ready_fn,
-            ready_during_attach: during_attach,
-            ready_during_destroy: during_destroy,
-            ready_logs: logs,
-            interrupted,
-            ..Mock::NEW
-        };
-    }
     NOW.store(100, Ordering::SeqCst);
     *CONTINUING.lock().unwrap() = None;
-    *CANCELLER.lock().unwrap() = None;
     let s = gst::glib::Object::builder::<MoqSink>()
         .property("sync", false)
         .build();
@@ -385,14 +103,14 @@ fn pad(s: &MoqSink, track: bool) -> MoqSinkPad {
             assert!(s.imp().open_sender(&mut ts));
             ts.preparing_tracks = None;
         }
-        let cfg = TrackConfig::new("", MediaType::Audio, Packaging::Cmaf, "");
+        let cfg = TrackCfg::new("", MediaType::Audio, Packaging::Cmaf, "");
         let t = s
             .imp()
             .send_lock()
             .sender
             .as_ref()
             .unwrap()
-            .add_track(cfg)
+            .add_track(&cfg)
             .unwrap();
         p.set_track(Some(t));
     }
@@ -440,8 +158,8 @@ fn incomplete_cmaf_eos(pending_moof: bool) {
     };
     assert!(p.state().splitter.push(bytes).is_ok());
     assert!(!eos(&s, &p));
-    assert_eq!(mock().ends, 0);
-    assert_eq!(mock().drains, 0);
+    assert_eq!(control().ends, 0);
+    assert_eq!(control().drains, 0);
     assert!(s.imp().send_lock().eos_failed);
     let msg = bus
         .pop_filtered(&[gst::MessageType::Error])
@@ -471,10 +189,10 @@ fn budget() {
     let _suite = suite();
     let s = make_sink();
     let p = pad(&s, true);
-    mock().refusals = 2;
+    control().refuse_ends = 2;
     assert!(eos(&s, &p));
-    assert_eq!(mock().ends, 3);
-    assert_eq!(mock().budget, USEC_PER_SEC as u64);
+    assert_eq!(control().ends, 3);
+    assert_eq!(control().budget, USEC_PER_SEC as u64);
     release(&s, p);
     finish(s);
 }
@@ -486,12 +204,12 @@ fn independent() {
     let a = pad(&s, true);
     let b = pad(&s, true);
     *CONTINUING.lock().unwrap() = Some(b.clone());
-    mock().refusals = 1;
+    control().refuse_ends = 1;
     assert!(eos(&s, &a));
-    assert_eq!(mock().writes, 1);
-    assert!(mock().ended[0]);
-    assert!(!mock().ended[1]);
-    assert_eq!(mock().drains, 0);
+    assert_eq!(control().writes, 1);
+    assert!(control().ended[0]);
+    assert!(!control().ended[1]);
+    assert_eq!(control().drains, 0);
     *CONTINUING.lock().unwrap() = None;
     release(&s, a);
     release(&s, b);
@@ -506,11 +224,11 @@ fn released() {
     let b = pad(&s, true);
     flush(&s, &b, true);
     release(&s, a);
-    assert!(!mock().ended[0]);
-    assert!(mock().interrupted);
+    assert!(!control().ended[0]);
+    assert!(control().interrupted);
     flush(&s, &b, false);
-    assert!(mock().ended[0]);
-    assert!(!mock().ended[1]);
+    assert!(control().ended[0]);
+    assert!(!control().ended[1]);
     release(&s, b);
     finish(s);
 }
@@ -520,7 +238,7 @@ fn flush_count() {
     let _suite = suite();
     // The C suite ran this after /sink/released, whose teardown leaves the
     // interrupt latch set; with no endpoint opened here nothing may clear it.
-    mock().interrupted = true;
+    control().interrupted = true;
     let s = make_sink();
     let a = pad(&s, false);
     let b = pad(&s, false);
@@ -531,10 +249,10 @@ fn flush_count() {
     flush(&s, &b, true);
     release(&s, a);
     assert_eq!(s.imp().obj_lock().flush_count, 1);
-    assert!(mock().interrupted);
+    assert!(control().interrupted);
     s.imp().obj_lock().state_flushing = true;
     flush(&s, &b, false);
-    assert!(mock().interrupted);
+    assert!(control().interrupted);
     release(&s, b);
     finish(s);
 }
@@ -543,20 +261,20 @@ fn flush_count() {
 fn failed() {
     let _suite = suite();
     for result in [
-        MOQ_DONE,
-        MOQ_ERR_INTERRUPTED,
-        MOQ_ERR_CLOSED,
-        MOQ_ERR_UNSUPPORTED,
-        MOQ_ERR_WRONG_STATE,
+        Ok(WaitResult::TimedOut),
+        Err(Error::INTERRUPTED),
+        Err(Error::CLOSED),
+        Err(Error::UNSUPPORTED),
+        Err(Error::WRONG_STATE),
     ] {
         let s = make_sink();
         let p = pad(&s, true);
         let bus = gst::Bus::new();
         s.set_bus(Some(&bus));
-        mock().drain_result = result;
+        control().drain_result = Some(result);
         assert!(!eos(&s, &p));
         let m = bus.pop().expect("a message");
-        assert_eq!(m.type_(), gst::MessageType::Error, "rc={result}");
+        assert_eq!(m.type_(), gst::MessageType::Error, "drain={result:?}");
         assert!(bus.pop().is_none());
         release(&s, p);
         s.set_bus(None);
@@ -569,11 +287,14 @@ fn cancel() {
     let _suite = suite();
     let s = make_sink();
     let p = pad(&s, true);
-    *CANCELLER.lock().unwrap() = Some(p.clone());
-    mock().cancel_drain = true;
+    // Flushing the draining pad from inside drain is what cancels the EOS.
+    let canceller = p.clone();
+    control().on_drain = Some(Box::new(move || {
+        active().imp().set_pad_flush(&canceller, true);
+    }));
     assert!(!eos(&s, &p));
-    assert!(mock().interrupted);
-    mock().cancel_drain = false;
+    assert!(control().interrupted);
+    control().on_drain = None;
     release(&s, p);
     finish(s);
 }
@@ -587,9 +308,9 @@ fn aggregation() {
     a.set_eos(true);
     assert!(eos(&s, &b));
     assert!(!s.imp().obj_lock().eos_posted);
-    assert_eq!(mock().drains, 0);
+    assert_eq!(control().drains, 0);
     release(&s, a);
-    assert_eq!(mock().drains, 1);
+    assert_eq!(control().drains, 1);
     release(&s, b);
     finish(s);
 }
@@ -603,12 +324,12 @@ fn restart() {
     assert!(eos(&s, &p));
     p.state().splitter.buf.push(b'x');
     let _ = s.set_state(gst::State::Ready);
-    assert_eq!(mock().destroys, 1);
+    assert_eq!(control().destroys, 1);
     let _ = s.set_state(gst::State::Paused);
     assert!(p.track().is_none());
     assert!(!p.eos());
     assert!(p.state().splitter.buf.is_empty());
-    assert_eq!(mock().connects, 1); // reconnect is deferred until media
+    assert_eq!(control().connects, 1); // reconnect is deferred until media
     release(&s, p);
     finish(s);
 }
@@ -622,29 +343,34 @@ fn deadline() {
     flush(&s, &b, true);
     release(&s, a);
     NOW.fetch_add(EOS_DRAIN_TIMEOUT_US, Ordering::SeqCst);
-    let before = mock().ends;
+    let before = control().ends;
     flush(&s, &b, false);
-    assert_eq!(mock().ends, before);
+    assert_eq!(control().ends, before);
     assert!(s.imp().send_lock().eos_failed);
-    assert!(!mock().ended[0]);
+    assert!(!control().ended[0]);
     release(&s, b);
     finish(s);
 }
 
-fn ready_callback(early: bool) {
+/// Readiness is polled now, not delivered by a callback: the element logs the
+/// record once, when `is_ready` first holds. `late` makes it hold only after
+/// the element has waited, which is the case the old
+/// `ready_after_attach`/`ready_during_attach` pair covered through libmoq's
+/// deleted `on_ready` callback.
+fn ready_record(late: bool) {
     let _suite = suite();
-    {
-        let mut m = mock();
-        m.ready_logs = 0;
-        m.ready_during_attach = early;
+    if late {
+        control().not_ready_for = 2;
     }
+    let logs = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let seen = logs.clone();
     let cat = *super::imp::CAT;
     let previous = cat.threshold();
-    let capture = gst::log::add_log_function(|cat, _level, _file, _function, _line, _obj, msg| {
+    let capture = gst::log::add_log_function(move |cat, _level, _file, _function, _line, _obj, msg| {
         let Some(text) = msg.get() else { return };
         if cat.name() == "moqsink" && text.starts_with("native sender ready") {
             assert_eq!(text.as_str(), "native sender ready namespace=example");
-            mock().ready_logs += 1;
+            seen.fetch_add(1, Ordering::SeqCst);
         }
     });
     cat.set_threshold(gst::DebugLevel::Info);
@@ -653,27 +379,13 @@ fn ready_callback(early: bool) {
     let _ = s.set_state(gst::State::Paused);
     assert!(s.imp().started.load(Ordering::SeqCst));
     let p = pad(&s, true);
-    assert_eq!(mock().ready_logs, if early { 1 } else { 0 });
-    if !early {
-        // Attach success is not readiness; only the callback emits the record.
-        let (ctx, f) = {
-            let m = mock();
-            (m.ready_ctx, m.ready_fn)
-        };
-        let sender = s.imp().send_lock().sender.as_ref().unwrap().as_ptr();
-        unsafe { f.unwrap()(ctx.ptr(), sender) };
-        assert_eq!(mock().ready_logs, 1);
+    // Exactly one record, whether readiness held at once or after waiting.
+    assert_eq!(logs.load(Ordering::SeqCst), 1);
+    if late {
+        // It polled until readiness held rather than giving up.
+        assert!(control().ready_calls >= 3);
     }
-    mock().ready_during_destroy = true; // Context must survive callback settlement.
-    let _ = s.set_state(gst::State::Ready);
-    assert_eq!(mock().ready_logs, 2);
-    // The callback context went with the sender, after its destroy.
-    assert!(s.imp().send_lock().sender.is_none());
-    {
-        let mut m = mock();
-        m.ready_during_destroy = false;
-        m.ready_during_attach = false;
-    }
+
     gst::log::remove_log_function(capture);
     cat.set_threshold(previous);
     release(&s, p);
@@ -681,11 +393,11 @@ fn ready_callback(early: bool) {
 }
 
 #[test]
-fn ready_after_attach() {
-    ready_callback(false);
+fn ready_at_attach() {
+    ready_record(false);
 }
 
 #[test]
-fn ready_during_attach() {
-    ready_callback(true);
+fn ready_after_waiting() {
+    ready_record(true);
 }
